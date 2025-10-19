@@ -1,3 +1,4 @@
+import argparse
 from datasets import load_dataset
 from model import Model
 
@@ -27,34 +28,6 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
         if test_suite(seed):
             success = True
             continue  # no repair needed for this seed
-
-        current_program = seed
-
-    #     # ---------- Stage 2: Iterative self-repair ----------
-    #     for iteration in range(max_iters):
-
-    #         if mode == "critique+refine":
-    #             feedback = model.generate_feedback(task, current_program, temperature=0)
-    #             candidates = [model.refine(task, current_program, feedback, temperature=0)
-    #                           for _ in range(nr)]
-    #         elif mode == "direct":
-    #             candidates = [model.refine(task, current_program, temperature=0)
-    #                           for _ in range(nr)]
-    #         else:
-    #             raise ValueError("Unknown refinement mode")
-
-    #         all_programs.extend(candidates)
-
-    #         # Evaluate all repair candidates
-    #         for candidate in candidates:
-    #             if test_suite(candidate):
-    #                 success = True
-    #                 break  # stop repairing this seed if success
-    #         if success:
-    #             break  # exit iteration loop once a pass is found
-
-    #         # choose next program to repair (greedy or best according to some heuristic)
-    #         current_program = select_next_candidate(candidates) # TODO: Define function.
 
     # ---------- Stage 3: Return aggregated results ----------
     return {
@@ -105,30 +78,74 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
     return test_suite
 
 
-# Load one MBPP task
-task_id, task_description, setup_code, tests = load_mbpp_task(0)
-model = Model(model_name="gpt-4o-mini", temperature=0)
-test_suite = make_mbpp_test_suite(setup_code, tests)
-result = run_self_repair(
-    task=task_description,
-    model=model,
-    test_suite=test_suite,
-    np=5,
-    nf=1,
-    nr=1
-)
-print(f"Result: {result}")
+def make_humaneval_test_suite(tests: str, entry_point: str):
+    """
+    Returns a callable test function that runs the HumanEval test string.
+    """
+    def test_suite(program_code: str) -> bool:
+        env = {}
+        try:
+            # 1. Define the functions in env
+            exec(program_code, env)
+
+            # 2. Ensure the expected function is defined
+            if entry_point not in env:
+                return False
+
+            # 3. Define the check() function from the test string
+            exec(tests, env)
+
+            # 4. Call check(candidate)
+            env["check"](env[entry_point])
+            return True
+        except Exception:
+            return False
+
+    return test_suite
 
 
-# # Load one humaneval-x task
-# task_id, prompt, tests, entry_point = load_humaneval_task()
-# model = Model(model_name="gpt-4o-mini", temperature=0)
-# result = run_self_repair(
-#     task=prompt,
-#     model=model,
-#     test_suite=tests,
-#     np=5,
-#     nf=1,
-#     nr=1
-# )
-# print(f"Result: {result}")
+def main():
+    parser = argparse.ArgumentParser(description="Run self-repair on MBPP or HumanEval.")
+    parser.add_argument("--dataset", choices=["mbpp", "humaneval"], required=True)
+    parser.add_argument("--task_index", type=int, default=0)
+    parser.add_argument("--np", type=int, default=5, help="Number of seeds")
+    parser.add_argument("--nf", type=int, default=1, help="Feedback per failed program")
+    parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
+    parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    args = parser.parse_args()
+
+    model = Model(model_name="gpt-4o-mini", temperature=0)
+
+    if args.dataset == "mbpp":
+        task_id, task_description, setup_code, tests = load_mbpp_task(args.task_index)
+        test_suite = make_mbpp_test_suite(setup_code, tests)
+        result = run_self_repair(
+            task=task_description,
+            model=model,
+            test_suite=test_suite,
+            np=5,
+            nf=1,
+            nr=1
+        )
+
+    elif args.dataset == "humaneval":
+        task_id, prompt, tests, entry_point = load_humaneval_task()
+        test_suite = make_humaneval_test_suite(tests, entry_point)
+        result = run_self_repair(
+            task=prompt,
+            model=model,
+            test_suite=test_suite,
+            np=5,
+            nf=1,
+            nr=1
+        )
+
+    print(f"\nDataset: {args.dataset}")
+    print(f"Model: {model.model_name}")
+    print(f"Task ID: {task_id}")
+    print(f"Result: {result}")
+
+
+if __name__ == "__main__":
+    main()
