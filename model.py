@@ -41,7 +41,27 @@ class Model:
         """
         Ask the model to critique a program that failed its test cases.
         """
-        pass
+        temperature = temperature if temperature is not None else self.temperature
+
+        prompt = (
+            f"The following program did not pass its tests.\n\n"
+            f"Task:\n{task_description}\n\n"
+            f"Program:\n{program}\n\n"
+            f"Please explain what might be wrong and how to fix it."
+        )
+
+        response = self.client.responses.create(
+                model=self.model_name,
+                input=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    },
+                ],
+                temperature=temperature,
+            )
+
+        return response.output_text
 
     def refine(self,
                task_description,
@@ -52,4 +72,31 @@ class Model:
         Ask the model to revise its program, either directly or using critique
         feedback.
         """
-        pass
+        temperature = temperature if temperature is not None else self.temperature
+
+        if feedback:
+            prompt = (
+                f"Task:\n{task_description}\n\n"
+                f"Current Program:\n{program}\n\n"
+                f"Feedback:\n{feedback}\n\n"
+                f"Revise the program to address the feedback. Only return the corrected code."
+            )
+        else:
+            prompt = (
+                f"Task:\n{task_description}\n\n"
+                f"Current Program:\n{program}\n\n"
+                f"Revise and improve the program to make it pass all tests."
+            )
+
+        response = self.client.responses.create(
+            model=self.model_name,
+            input=[
+                {
+                    "role": "user",
+                    "content": prompt
+                },
+            ],
+            temperature=temperature,
+        )
+
+        return response.output_text

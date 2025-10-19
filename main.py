@@ -37,6 +37,23 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
             success = True
             continue  # no repair needed for this seed
 
+        current_program = seed
+
+        # ---------- Stage 2: Iterative self-repair ----------
+        for iteration in range(max_iters):
+
+            if mode == "critique+refine":
+                feedback = model.generate_feedback(task, current_program, temperature=0)
+                candidates = [model.refine(task, current_program, feedback, temperature=0)
+                              for _ in range(nr)]
+            elif mode == "direct":
+                candidates = [model.refine(task, current_program, temperature=0)
+                              for _ in range(nr)]
+            else:
+                raise ValueError("Unknown refinement mode")
+
+            all_programs.extend(candidates)
+
     # ---------- Stage 3: Return aggregated results ----------
     return {
         "task_id": task,
