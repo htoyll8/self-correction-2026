@@ -1,3 +1,4 @@
+import re
 import json
 import argparse
 from tqdm import tqdm
@@ -27,9 +28,12 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
     seeds = model.generate(task_description=task, n=np, temperature=0.7)  # diversity via temp>0
     all_programs.extend(seeds)
 
-    for seed in seeds:
+    for i, seed in enumerate(seeds, 1):
         # Evaluate initial seed
-        if test_suite(seed):
+        code = extract_code(seed)
+        result = test_suite(code)
+        print(f"Seed {i} → passed? {result}")
+        if result:
             success = True
             continue  # no repair needed for this seed
 
@@ -40,6 +44,18 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
         "all_programs": all_programs,    # for pass@k counting
         "k": len(all_programs)           # total samples = np + np*nf*nr (approx)
     }
+
+
+def extract_code(text: str) -> str:
+    """
+    Extracts the Python code block from an LLM output string.
+    If no ``` fences are found, returns the whole string.
+    """
+    code_blocks = re.findall(r"```(?:python)?(.*?)```", text, flags=re.DOTALL)
+    if code_blocks:
+        return code_blocks[0].strip()
+    else:
+        return text.strip()
 
 
 def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
