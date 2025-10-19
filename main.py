@@ -1,5 +1,9 @@
+import json
 import argparse
+from tqdm import tqdm
+from datetime import datetime
 from datasets import load_dataset
+
 from model import Model
 
 
@@ -36,25 +40,6 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
         "all_programs": all_programs,    # for pass@k counting
         "k": len(all_programs)           # total samples = np + np*nf*nr (approx)
     }
-
-
-def load_mbpp_task(task_index=0):
-    ds = load_dataset("Muennighoff/mbpp", "sanitized")
-    example = ds["test"][task_index]
-    task_description = example["prompt"]
-    setup_code = example["test_imports"]
-    tests = example["test_list"]
-    return example["task_id"], task_description, setup_code, tests
-
-
-def load_humaneval_task(task_index=0):
-    ds = load_dataset("openai/openai_humaneval")
-    example = ds["test"][task_index]
-    task_id = example["task_id"]
-    prompt = example["prompt"]
-    tests = example["test"]
-    entry_point = example["entry_point"]
-    return task_id, prompt, tests, entry_point
 
 
 def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
@@ -113,38 +98,72 @@ def main():
     parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max_tasks", type=int, default=None, help="Limit tasks for debugging")
     args = parser.parse_args()
 
-    model = Model(model_name="gpt-4o-mini", temperature=0)
+    model = Model(model_name=args.model_name, temperature=args.temperature)
+    results = []
 
     if args.dataset == "mbpp":
-        task_id, task_description, setup_code, tests = load_mbpp_task(args.task_index)
-        test_suite = make_mbpp_test_suite(setup_code, tests)
-        result = run_self_repair(
-            task=task_description,
-            model=model,
-            test_suite=test_suite,
-            np=5,
-            nf=1,
-            nr=1
-        )
+        ds = load_dataset("Muennighoff/mbpp", "sanitized")["test"]
+        print(f"Loaded MBPP with {len(ds)} test tasks.")
+        for i, ex in enumerate(tqdm(ds, desc="Running MBPP tasks")):
+            if args.max_tasks and i >= args.max_tasks:
+                break
+            task_id, desc, setup, tests = (
+                ex["task_id"],
+                ex["prompt"],
+                ex["test_imports"],
+                ex["test_list"],
+            )
+            test_suite = make_mbpp_test_suite(setup, tests)
+            result = run_self_repair(
+                task=desc,
+                model=model,
+                test_suite=test_suite,
+                np=args.np,
+                nf=args.nf,
+                nr=args.nr
+            )
+            result["dataset"] = "mbpp"
+            result["task_id"] = task_id
+            results.append(result)
 
     elif args.dataset == "humaneval":
-        task_id, prompt, tests, entry_point = load_humaneval_task()
-        test_suite = make_humaneval_test_suite(tests, entry_point)
-        result = run_self_repair(
-            task=prompt,
-            model=model,
-            test_suite=test_suite,
-            np=5,
-            nf=1,
-            nr=1
-        )
+        ds = load_dataset("openai/openai_humaneval")["test"]
+        print(f"Loaded HumanEval with {len(ds)} test tasks.")
+        for i, ex in enumerate(tqdm(ds, desc="Running HumanEval tasks")):
+            if args.max_tasks and i >= args.max_tasks:
+                break
+            task_id, prompt, tests, entry_point = (
+                    ex["task_id"],
+                    ex["prompt"],
+                    ex["test"],
+                    ex["entry_point"]
+                )
+            test_suite = make_humaneval_test_suite(tests, entry_point)
+            result = run_self_repair(
+                task=prompt,
+                model=model,
+                test_suite=test_suite,
+                np=5,
+                nf=1,
+                nr=1
+            )
+            result["dataset"] = "mbpp"
+            result["task_id"] = task_id
+            results.append(result)
 
-    print(f"\nDataset: {args.dataset}")
-    print(f"Model: {model.model_name}")
-    print(f"Task ID: {task_id}")
-    print(f"Result: {result}")
+    # ---------- Save results ----------
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out_path = f"results/results_{args.dataset}_{timestamp}.jsonl"
+    with open(out_path, "w") as f:
+        for r in results:
+            json.dump(r, f, indent=2, ensure_ascii=False)
+            f.write("\n\n")
+
+    print(f"\n✅ Completed {len(results)} tasks from {args.dataset}.")
+    print(f"Results saved to {out_path}")
 
 
 if __name__ == "__main__":
