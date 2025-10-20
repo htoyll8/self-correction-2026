@@ -21,45 +21,87 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
     mode: "critique+refine" or "direct"
     """
 
-    all_programs = []  # all generated code (for pass@k accounting)
+    trajectories = []  # all generated code (for pass@k accounting)
     success = False
 
     # ---------- Stage 1: Initial generation ----------
     seeds = model.generate(task_description=task, n=np, temperature=0.7)  # diversity via temp>0
-    all_programs.extend(seeds)
 
     for i, seed in enumerate(seeds, 1):
         # Evaluate initial seed
-        code = extract_code(seed)
-        result = test_suite(code)
-        print(f"Seed {i} → passed? {result}")
-        if result:
+        seed_code = extract_code(seed)
+        passed = test_suite(seed_code)
+        print(f"Seed {i} → passed? {passed}")
+
+        trajectory = {
+            "seed_index": i,
+            "initial_program": seed_code,
+            "initial_passed": passed,
+            "iterations": []
+        }
+
+        if passed:
             success = True
+            trajectories.append(trajectory)
             continue  # no repair needed for this seed
 
         current_program = seed
 
         # ---------- Stage 2: Iterative self-repair ----------
-        for iteration in range(max_iters):
+        for iteration in range(1, max_iters + 1):
+            iteration_record = {"iteration": iteration, "feedback_groups": []}
 
-            if mode == "critique+refine":
-                feedback = model.generate_feedback(task, current_program, temperature=0)
-                candidates = [model.refine(task, current_program, feedback, temperature=0)
-                              for _ in range(nr)]
-            elif mode == "direct":
-                candidates = [model.refine(task, current_program, temperature=0)
-                              for _ in range(nr)]
-            else:
-                raise ValueError("Unknown refinement mode")
+            for f_i in range(nf):
+                feedback_group = {}
 
-            all_programs.extend(candidates)
+                if mode == "critique+refine":
+                    feedback = model.generate_feedback(task, current_program, temperature=0)
+                    feedback_group["feedback"] = feedback
+                    candidates = [
+                        model.refine(task, current_program, feedback, temperature=0)
+                        for _ in range(nr)
+                    ]
+                elif mode == "direct":
+                    feedback_group["feedback"] = None
+                    candidates = [
+                        model.refine(task, current_program, temperature=0)
+                        for _ in range(nr)
+                    ]
+                else:
+                    raise ValueError("Unknown refinement mode")
+
+                feedback_group["repairs"] = []
+                for cand in candidates:
+                    code = extract_code(cand)
+                    passed = test_suite(code)
+                    feedback_group["repairs"].append({"program": code, "passed": passed})
+                    print(f"  Iter {iteration}, feedback {f_i+1}: repair → passed? {passed}")
+                    if passed:
+                        success = True
+                        break
+
+                iteration_record["feedback_groups"].append(feedback_group)
+                if success:
+                    break  # stop further feedbacks/iterations once a pass found
+
+                # choose next current_program (last repair attempt)
+                current_program = extract_code(candidates[-1])
+
+            trajectories[-1]["iterations"].append(iteration_record)
+            if success:
+                break
 
     # ---------- Stage 3: Return aggregated results ----------
+    total_programs = sum(
+        1 + sum(len(it["repairs"]) for it in t["iterations"])
+        for t in trajectories
+    )
+
     return {
         "task_id": task,
-        "success": success,              # True if any seed/repair passed
-        "all_programs": all_programs,    # for pass@k counting
-        "k": len(all_programs)           # total samples = np + np*nf*nr (approx)
+        "success": success,
+        "trajectories": trajectories,
+        "k": total_programs
     }
 
 
@@ -189,7 +231,7 @@ def main():
 
     # ---------- Save results ----------
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_path = f"results/results_{args.dataset}_{timestamp}.jsonl"
+    out_path = f"results/results_{args.model_name}_{args.dataset}_{timestamp}.jsonl"
     with open(out_path, "w") as f:
         for r in results:
             json.dump(r, f, indent=2, ensure_ascii=False)
