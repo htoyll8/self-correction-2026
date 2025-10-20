@@ -167,13 +167,18 @@ def make_humaneval_test_suite(tests: str, entry_point: str):
 def main():
     parser = argparse.ArgumentParser(description="Run self-repair on MBPP or HumanEval.")
     parser.add_argument("--dataset", choices=["mbpp", "humaneval"], required=True)
-    parser.add_argument("--task_index", type=int, default=0)
     parser.add_argument("--np", type=int, default=5, help="Number of seeds")
     parser.add_argument("--nf", type=int, default=1, help="Feedback per failed program")
     parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tasks", type=int, default=None, help="Limit tasks for debugging")
+    parser.add_argument(
+        "--task_ids",
+        nargs="+",
+        default=None,   # if not provided, we’ll run all tasks
+        help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35"
+    )
     args = parser.parse_args()
 
     model = Model(model_name=args.model_name, temperature=args.temperature)
@@ -181,8 +186,9 @@ def main():
 
     if args.dataset == "mbpp":
         ds = load_dataset("Muennighoff/mbpp", "sanitized")["test"]
-        print(f"Loaded MBPP with {len(ds)} test tasks.")
-        for i, ex in enumerate(tqdm(ds, desc="Running MBPP tasks")):
+        selected = ds if args.task_ids is None else [ex for ex in ds if str(ex["task_id"]) in args.task_ids]
+        print(f"Loaded MBPP with {len(selected)} test tasks.")
+        for i, ex in enumerate(tqdm(selected, desc="Running MBPP tasks")):
             if args.max_tasks and i >= args.max_tasks:
                 break
             task_id, desc, setup, tests = (
@@ -206,8 +212,9 @@ def main():
 
     elif args.dataset == "humaneval":
         ds = load_dataset("openai/openai_humaneval")["test"]
-        print(f"Loaded HumanEval with {len(ds)} test tasks.")
-        for i, ex in enumerate(tqdm(ds, desc="Running HumanEval tasks")):
+        selected = ds if args.task_ids is None else [ex for ex in ds if ex["task_id"] in args.task_ids]
+        print(f"Loaded HumanEval with {len(selected)} test tasks.")
+        for i, ex in enumerate(tqdm(selected, desc="Running HumanEval tasks")):
             if args.max_tasks and i >= args.max_tasks:
                 break
             task_id, prompt, tests, entry_point = (
@@ -225,7 +232,7 @@ def main():
                 nf=1,
                 nr=1
             )
-            result["dataset"] = "mbpp"
+            result["dataset"] = "humaneval"
             result["task_id"] = task_id
             results.append(result)
 
