@@ -40,9 +40,10 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
             "iterations": []
         }
 
+        trajectories.append(trajectory)
+
         if passed:
             success = True
-            trajectories.append(trajectory)
             continue  # no repair needed for this seed
 
         current_program = seed
@@ -92,8 +93,13 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
                 break
 
     # ---------- Stage 3: Return aggregated results ----------
+    print(f"Trajectories: {trajectories}")
     total_programs = sum(
-        1 + sum(len(it["repairs"]) for it in t["iterations"])
+        1 + sum(
+            len(fg["repairs"])
+            for it in t["iterations"]
+            for fg in it["feedback_groups"]
+        )
         for t in trajectories
     )
 
