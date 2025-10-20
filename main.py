@@ -46,54 +46,53 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
             success = True
             continue  # no repair needed for this seed
 
-        current_program = seed
-
         # ---------- Stage 2: Iterative self-repair ----------
+        current_program = seed
         for iteration in range(1, max_iters + 1):
             iteration_record = {"iteration": iteration, "feedback_groups": []}
+            print(f"  Starting iteration {iteration} for seed {i}")
 
-            for f_i in range(nf):
-                feedback_group = {}
+            feedback_group = {}
 
-                if mode == "critique+refine":
-                    feedback = model.generate_feedback(task, current_program, temperature=0)
-                    feedback_group["feedback"] = feedback
-                    candidates = [
-                        model.refine(task, current_program, feedback, temperature=0)
-                        for _ in range(nr)
-                    ]
-                elif mode == "direct":
-                    feedback_group["feedback"] = None
-                    candidates = [
-                        model.refine(task, current_program, temperature=0)
-                        for _ in range(nr)
-                    ]
+            if mode == "critique+refine":
+                feedback = model.generate_feedback(task, current_program, temperature=0)
+                feedback_group["feedback"] = feedback
+            else:
+                feedback_group["feedback"] = None
+
+            feedback_group["repairs"] = []
+
+            # retry up to nr times *based on the previous repair
+            for attempt in range(1, nr + 1):
+                refined = (
+                    model.refine(task, current_program, feedback, temperature=0)
+                    if mode == "critique+refine"
+                    else model.refine(task, current_program, temperature=0)
+                )
+                code = extract_code(refined)
+                passed = test_suite(code)
+                feedback_group["repairs"].append({
+                    "attempt": attempt,
+                    "program": code,
+                    "passed": passed
+                })
+                print(f"    Attempt {attempt} → passed? {passed}")
+
+                if passed:
+                    success = True
+                    break  # stop retrying; program fixed
                 else:
-                    raise ValueError("Unknown refinement mode")
+                    # update current_program to the latest failed repair
+                    current_program = code
 
-                feedback_group["repairs"] = []
-                for cand in candidates:
-                    code = extract_code(cand)
-                    passed = test_suite(code)
-                    feedback_group["repairs"].append({"program": code, "passed": passed})
-                    print(f"  Iter {iteration}, feedback {f_i+1}: repair → passed? {passed}")
-                    if passed:
-                        success = True
-                        break
-
-                iteration_record["feedback_groups"].append(feedback_group)
-                if success:
-                    break  # stop further feedbacks/iterations once a pass found
-
-                # choose next current_program (last repair attempt)
-                current_program = extract_code(candidates[-1])
-
+            iteration_record["feedback_groups"].append(feedback_group)
             trajectories[-1]["iterations"].append(iteration_record)
+
             if success:
+                print(f"  ✅ Success at iteration {iteration}")
                 break
 
     # ---------- Stage 3: Return aggregated results ----------
-    print(f"Trajectories: {trajectories}")
     total_programs = sum(
         1 + sum(
             len(fg["repairs"])
