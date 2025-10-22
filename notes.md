@@ -1,5 +1,26 @@
 ## Repair Trees in Self-Repair
 
+
+### Two Complementary Analyses
+
+We perform **two complementary analyses**, each capturing a different aspect of self-repair.
+
+**(1) Sequential “Rolling-Ball” Self-Repair.**
+First, we construct *repair trees*, where each repair is conditioned on the previous program’s output and feedback—a process we call the *rolling-ball* model of self-repair. This captures the **true causal dynamics** of iterative refinement: every node represents a new model invocation that depends on the most recent failed attempt. As a result, programs within a single tree are **not independent**; they form a temporally linked trajectory that reflects how the model learns to fix its own mistakes over time.
+
+**(2) Bootstrapped i.i.d. Resampling.**
+Second, we perform a **bootstrapped resampling** analysis to estimate *pass@k* efficiently across different generation budgets. The goal of this step is to approximate how success rates change with varying numbers of seeds, feedbacks, and repairs—without having to regenerate new repair trees for every setting. To do this, we first build one large *master repair tree* for each task, containing
+(N_p \ge n_p) initial seeds,
+(N_f \ge n_f) feedback messages per failed seed, and
+(N_r \ge n_r) repairs per feedback.
+We then simulate smaller experiments by randomly sampling (n_p) seeds, (n_f) feedbacks, and (n_r) repairs (with replacement) from this frozen master tree.
+
+This two-stage design serves **two purposes**:
+
+1. The *rolling-ball* analysis measures how models actually behave under iterative, feedback-conditioned repair—capturing causal improvement dynamics.
+2. The *bootstrapped resampling* analysis provides an efficient, *i.i.d.*-style estimate of pass@k (à la Chen et al., 2021), showing how success probability scales with available generation budget while remaining computationally feasible.
+
+
 ### Experimental Context
 
 We evaluate self-repair on HumanEval-style benchmarks (e.g., **HumanEval-X**, **MBPP**, and **TransCoder** tasks).
@@ -213,3 +234,10 @@ This follows the unbiased estimator introduced in Chen et al. (2021, *Codex*).
   * pass@k curves and 95% confidence intervals
 
 ---
+
+
+Here’s a smoother, reviewer-friendly version that makes both analyses crystal clear and explains *why* each is needed. It keeps the NeurIPS tone but reads naturally:
+
+
+---
+
