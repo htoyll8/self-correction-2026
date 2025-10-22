@@ -6,10 +6,10 @@
 We perform **two complementary analyses**, each capturing a different aspect of self-repair.
 
 **(1) Sequential “Rolling-Ball” Self-Repair.**
-First, we construct *repair trees*, where each repair is conditioned on the previous program’s output and feedback—a process we call the *rolling-ball* model of self-repair. This captures the **true causal dynamics** of iterative refinement: every node represents a new model invocation that depends on the most recent failed attempt. As a result, programs within a single tree are **not independent**; they form a temporally linked trajectory that reflects how the model learns to fix its own mistakes over time.
+First, we construct *repair trees*, where each repair is conditioned on the previous program’s output and feedback—a process we call the *rolling-ball* model of self-repair. This captures the **true causal dynamics** of iterative refinement: every node represents a new model invocation that depends on the most recent failed attempt. As a result, programs within a single tree are **not independent**.
 
 **(2) Bootstrapped i.i.d. Resampling.**
-Second, we perform a **bootstrapped resampling** analysis to estimate *pass@k* efficiently across different generation budgets. The goal of this step is to approximate how success rates change with varying numbers of seeds, feedbacks, and repairs—without having to regenerate new repair trees for every setting. To do this, we first build one large *master repair tree* for each task, containing
+Second, we perform a **bootstrapped resampling** analysis to estimate *pass@k* efficiently across different generation budgets. The goal of this step is to approximate how success rates change with varying numbers of seeds, feedbacks, and repairs—--without having to regenerate new repair trees for every setting. To do this, we first build one large *master repair tree* for each task, containing
 (N_p \ge n_p) initial seeds,
 (N_f \ge n_f) feedback messages per failed seed, and
 (N_r \ge n_r) repairs per feedback.
