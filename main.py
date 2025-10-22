@@ -8,6 +8,16 @@ from datasets import load_dataset
 from model import Model
 
 
+def extract_function_name_from_code(code: str) -> str | None:
+    """
+    Extracts the function name from a reference MBPP code snippet.
+    Example:
+      'def similar_elements(test_tup1, test_tup2):' -> 'similar_elements'
+    """
+    match = re.search(r"def\s+([a-zA-Z_]\w*)\s*\(", code)
+    return match.group(1) if match else None
+
+
 def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
                     nf=1, nr=1, mode="critique+refine"):
     """
@@ -64,6 +74,8 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
 
                     attempt_count += 1
                     print(f"  Attempt {attempt_count} (feedback {f_i+1}, repair {r_i}) → ", end="")
+
+                    print(f"Task in iterative refinement: {task}")
 
                     if mode == "critique+refine":
                         refined = model.refine(task, current_program, feedback, temperature=0)
@@ -128,14 +140,15 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
         env = {}
         try:
             # Run imports (e.g., 'import math')
-            exec(setup_code, env)
+            exec(setup_code or "", env)
             # Define the generated program
             exec(program_code, env)
             # Run all test assertions
             for test in test_list:
                 exec(test, env)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[Test failed] {type(e).__name__}: {e}")
             return False
 
     return test_suite
@@ -195,12 +208,18 @@ def main():
         for i, ex in enumerate(tqdm(selected, desc="Running MBPP tasks")):
             if args.max_tasks and i >= args.max_tasks:
                 break
-            task_id, desc, setup, tests = (
+            task_id, desc, setup, tests, ref_code  = (
                 ex["task_id"],
                 ex["prompt"],
                 ex["test_imports"],
                 ex["test_list"],
+                ex.get("code", "")
             )
+
+            func_name = extract_function_name_from_code(ref_code)
+            if func_name:
+                desc += f"\n\nThe function should be named `{func_name}`."
+
             test_suite = make_mbpp_test_suite(setup, tests)
             result = run_self_repair(
                 task=desc,
@@ -247,7 +266,6 @@ def main():
     out_path = f"results/results_{args.model_name}_{args.dataset}_{timestamp}.jsonl"
     with open(out_path, "w") as f:
         for r in results:
-            # json.dump(r, f, indent=2, ensure_ascii=False)
             json.dump(r, f, ensure_ascii=False, separators=(",", ":"))
             f.write("\n\n")
 
