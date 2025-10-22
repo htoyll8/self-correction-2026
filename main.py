@@ -8,7 +8,7 @@ from datasets import load_dataset
 from model import Model
 
 
-def run_self_repair(task, model, test_suite, np=5, max_iters=10,
+def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
                     nf=1, nr=1, mode="critique+refine"):
     """
     task: natural-language description of the problem
@@ -17,18 +17,17 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
     np: number of initial seeds
     nf: number of feedback messages per failed program
     nr: number of repairs per feedback
-    max_iters: maximum repair depth per seed
+    max_attempts: total number of repair retries per seed
     mode: "critique+refine" or "direct"
     """
 
-    trajectories = []  # all generated code (for pass@k accounting)
+    trajectories = []
     success = False
 
     # ---------- Stage 1: Initial generation ----------
-    seeds = model.generate(task_description=task, n=np, temperature=0.7)  # diversity via temp>0
+    seeds = model.generate(task_description=task, n=np, temperature=0.7)
 
     for i, seed in enumerate(seeds, 1):
-        # Evaluate initial seed
         seed_code = extract_code(seed)
         passed = test_suite(seed_code)
         print(f"Seed {i} → passed? {passed}")
@@ -37,70 +36,69 @@ def run_self_repair(task, model, test_suite, np=5, max_iters=10,
             "seed_index": i,
             "initial_program": seed_code,
             "initial_passed": passed,
-            "iterations": []
+            "attempts": []
         }
-
         trajectories.append(trajectory)
 
         if passed:
             success = True
-            continue  # no repair needed for this seed
+            continue
 
-        # ---------- Stage 2: Iterative self-repair ----------
-        current_program = seed
-        for iteration in range(1, max_iters + 1):
-            iteration_record = {"iteration": iteration, "feedback_groups": []}
-            print(f"  Starting iteration {iteration} for seed {i}")
+        current_program = seed_code
+        attempt_count = 0  # total repairs tried for this seed
+        seed_success = False
 
-            feedback_group = {}
+        # ---------- Stage 2: Iterative repair ----------
+        while attempt_count < max_attempts and not seed_success:
+            for f_i in range(nf):
+                if attempt_count >= max_attempts:
+                    break
 
-            if mode == "critique+refine":
-                feedback = model.generate_feedback(task, current_program, temperature=0)
-                feedback_group["feedback"] = feedback
-            else:
-                feedback_group["feedback"] = None
+                feedback = None
+                if mode == "critique+refine":
+                    feedback = model.generate_feedback(task, current_program, temperature=0)
 
-            feedback_group["repairs"] = []
+                for r_i in range(1, nr + 1):
+                    if attempt_count >= max_attempts:
+                        break
 
-            # retry up to nr times *based on the previous repair
-            for attempt in range(1, nr + 1):
-                refined = (
-                    model.refine(task, current_program, feedback, temperature=0)
-                    if mode == "critique+refine"
-                    else model.refine(task, current_program, temperature=0)
-                )
-                code = extract_code(refined)
-                passed = test_suite(code)
-                feedback_group["repairs"].append({
-                    "attempt": attempt,
-                    "program": code,
-                    "passed": passed
-                })
-                print(f"    Attempt {attempt} → passed? {passed}")
+                    attempt_count += 1
+                    print(f"  Attempt {attempt_count} (feedback {f_i+1}, repair {r_i}) → ", end="")
 
-                if passed:
-                    success = True
-                    break  # stop retrying; program fixed
-                else:
-                    # update current_program to the latest failed repair
-                    current_program = code
+                    if mode == "critique+refine":
+                        refined = model.refine(task, current_program, feedback, temperature=0)
+                    elif mode == "direct":
+                        refined = model.refine(task, current_program, temperature=0)
+                    else:
+                        raise ValueError("Unknown refinement mode")
 
-            iteration_record["feedback_groups"].append(feedback_group)
-            trajectories[-1]["iterations"].append(iteration_record)
+                    code = extract_code(refined)
+                    passed = test_suite(code)
 
-            if success:
-                print(f"  ✅ Success at iteration {iteration}")
-                break
+                    trajectory["attempts"].append({
+                        "attempt": attempt_count,
+                        "feedback_index": f_i + 1,
+                        "repair_index": r_i,
+                        "feedback": feedback,
+                        "program": code,
+                        "passed": passed
+                    })
+
+                    print("✅ success" if passed else "failed")
+
+                    if passed:
+                        seed_success = True
+                        success = True
+                        print(f"  ✅ Seed {i} succeeded after {attempt_count} attempts")
+                        break
+
+                    current_program = code  # next repair builds on last attempt
+
+                if seed_success:
+                    break
 
     # ---------- Stage 3: Return aggregated results ----------
-    total_programs = sum(
-        1 + sum(
-            len(fg["repairs"])
-            for it in t["iterations"]
-            for fg in it["feedback_groups"]
-        )
-        for t in trajectories
-    )
+    total_programs = sum(1 + len(t["attempts"]) for t in trajectories)
 
     return {
         "task_id": task,
@@ -175,6 +173,7 @@ def main():
     parser.add_argument("--np", type=int, default=5, help="Number of seeds")
     parser.add_argument("--nf", type=int, default=1, help="Feedback per failed program")
     parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
+    parser.add_argument("--max_attempts", type=int, default=10, help="Maximum refinement iterations per seed")
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tasks", type=int, default=None, help="Limit tasks for debugging")
@@ -209,7 +208,8 @@ def main():
                 test_suite=test_suite,
                 np=args.np,
                 nf=args.nf,
-                nr=args.nr
+                nr=args.nr,
+                max_attempts=args.max_attempts
             )
             result["dataset"] = "mbpp"
             result["task_id"] = task_id
@@ -233,9 +233,10 @@ def main():
                 task=prompt,
                 model=model,
                 test_suite=test_suite,
-                np=5,
-                nf=1,
-                nr=1
+                np=args.np,
+                nf=args.nf,
+                nr=args.nr,
+                max_attempts=args.max_attempts
             )
             result["dataset"] = "humaneval"
             result["task_id"] = task_id
@@ -246,7 +247,8 @@ def main():
     out_path = f"results/results_{args.model_name}_{args.dataset}_{timestamp}.jsonl"
     with open(out_path, "w") as f:
         for r in results:
-            json.dump(r, f, indent=2, ensure_ascii=False)
+            # json.dump(r, f, indent=2, ensure_ascii=False)
+            json.dump(r, f, ensure_ascii=False, separators=(",", ":"))
             f.write("\n\n")
 
     print(f"\n✅ Completed {len(results)} tasks from {args.dataset}.")
