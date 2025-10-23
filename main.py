@@ -139,23 +139,38 @@ def extract_code(text: str) -> str:
 
 
 def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
-    def test_suite(program_code: str) -> bool:
-        """
-        Executes the candidate program and returns True if all tests pass.
-        """
+    """
+    Executes MBPP test cases and reports fractional correctness and detailed outcomes.
+    Returns (fraction_passed, results_list).
+    """
+    def test_suite(program_code: str):
         env = {}
         try:
-            # Run imports (e.g., 'import math')
+            # Load imports and helper code
             exec(setup_code or "", env)
-            # Define the generated program
+            # Define the candidate program
             exec(program_code, env)
-            # Run all test assertions
-            for test in test_list:
-                exec(test, env)
-            return True
         except Exception as e:
-            print(f"[Test failed] {type(e).__name__}: {e}")
-            return False
+            print(f"[Setup failed] {type(e).__name__}: {e}")
+            return 0.0, [("setup", f"⚠️ ERROR: {type(e).__name__}: {e}", "<program setup>")]
+
+        passed, total = 0, len(test_list)
+        results = []
+
+        # Execute each test independently
+        for i, test in enumerate(test_list, 1):
+            try:
+                exec(test, env)
+                passed += 1
+                results.append((i, "✅ PASS", test))
+            except AssertionError:
+                results.append((i, "❌ FAIL", test))
+            except Exception as e:
+                tb = traceback.format_exception_only(type(e), e)[0].strip()
+                results.append((i, f"⚠️ ERROR: {tb}", test))
+
+        frac_passed = passed / total if total > 0 else 0.0
+        return frac_passed, results
 
     return test_suite
 
