@@ -1,6 +1,7 @@
 import re
 import json
 import argparse
+import traceback
 from tqdm import tqdm
 from datetime import datetime
 from datasets import load_dataset
@@ -39,18 +40,22 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
 
     for i, seed in enumerate(seeds, 1):
         seed_code = extract_code(seed)
-        passed = test_suite(seed_code)
-        print(f"Seed {i} → passed? {passed}")
+        frac_passed, results = test_suite(seed_code)
+        print(f"Seed {i} → passed {frac_passed*100:.1f}% of tests")
+
+        fully_passed = frac_passed == 1.0
 
         trajectory = {
             "seed_index": i,
             "initial_program": seed_code,
-            "initial_passed": passed,
+            "initial_passed": fully_passed,
+            "pass_fraction": frac_passed,
+            "test_results": results,
             "attempts": []
         }
         trajectories.append(trajectory)
 
-        if passed:
+        if fully_passed:
             success = True
             continue
 
@@ -75,8 +80,6 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
                     attempt_count += 1
                     print(f"  Attempt {attempt_count} (feedback {f_i+1}, repair {r_i}) → ", end="")
 
-                    print(f"Task in iterative refinement: {task}")
-
                     if mode == "critique+refine":
                         refined = model.refine(task, current_program, feedback, temperature=0)
                     elif mode == "direct":
@@ -85,7 +88,8 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
                         raise ValueError("Unknown refinement mode")
 
                     code = extract_code(refined)
-                    passed = test_suite(code)
+                    frac_passed, results = test_suite(code)
+                    fully_passed = frac_passed == 1.0
 
                     trajectory["attempts"].append({
                         "attempt": attempt_count,
@@ -93,12 +97,14 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
                         "repair_index": r_i,
                         "feedback": feedback,
                         "program": code,
-                        "passed": passed
+                        "pass_fraction": frac_passed,
+                        "test_results": results,
+                        "passed": fully_passed
                     })
 
-                    print("✅ success" if passed else "failed")
+                    print(f"✅ success ({frac_passed*100:.1f}%)" if fully_passed else f"failed ({frac_passed*100:.1f}%)")
 
-                    if passed:
+                    if fully_passed:
                         seed_success = True
                         success = True
                         print(f"  ✅ Seed {i} succeeded after {attempt_count} attempts")
@@ -156,26 +162,50 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
 
 def make_humaneval_test_suite(tests: str, entry_point: str):
     """
-    Returns a callable test function that runs the HumanEval test string.
+    Returns a callable test function that executes HumanEval-style tests.
+    Reports both the fraction of passed test cases and a summary of outcomes.
     """
-    def test_suite(program_code: str) -> bool:
+    def test_suite(program_code: str):
         env = {}
         try:
-            # 1. Define the functions in env
+            # Load the candidate program
             exec(program_code, env)
 
-            # 2. Ensure the expected function is defined
             if entry_point not in env:
-                return False
+                print(f"[Error] Function '{entry_point}' not defined.")
+                return 0.0, []
 
-            # 3. Define the check() function from the test string
-            exec(tests, env)
+            candidate = env[entry_point]
 
-            # 4. Call check(candidate)
-            env["check"](env[entry_point])
-            return True
-        except Exception:
-            return False
+            # Extract assert lines safely
+            assert_lines = [
+                line.strip()
+                for line in tests.splitlines()
+                if line.strip().startswith("assert ")
+            ]
+            total = len(assert_lines)
+            passed = 0
+            results = []
+
+            # Execute each assertion individually
+            for i, assert_line in enumerate(assert_lines, 1):
+                # Example: assert candidate([1, 2, 3], 0.5) == True
+                try:
+                    exec(assert_line, {**env, "candidate": candidate})
+                    passed += 1
+                    results.append((i, "✅ PASS", assert_line))
+                except AssertionError:
+                    results.append((i, "❌ FAIL", assert_line))
+                except Exception as e:
+                    tb = traceback.format_exception_only(type(e), e)[0].strip()
+                    results.append((i, f"⚠️ ERROR: {tb}", assert_line))
+
+            fraction = passed / total if total > 0 else 0.0
+            return fraction, results
+
+        except Exception as e:
+            print(f"[Fatal Error] {e}")
+            return 0.0, []
 
     return test_suite
 
