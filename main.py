@@ -49,9 +49,9 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
             "seed_index": i,
             "initial_program": seed_code,
             "initial_passed": fully_passed,
-            "pass_fraction": frac_passed,
-            "test_results": results,
-            "attempts": []
+            "initial_pass_fraction": frac_passed,
+            "initial_test_results": results,
+            "feedback_repairs": []  # <--- store all nf × nr pairs here
         }
         trajectories.append(trajectory)
 
@@ -60,63 +60,49 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
             continue
 
         current_program = seed_code
-        attempt_count = 0  # total repairs tried for this seed
-        seed_success = False
 
         # ---------- Stage 2: Iterative repair ----------
-        while attempt_count < max_attempts and not seed_success:
-            for f_i in range(nf):
-                if attempt_count >= max_attempts:
-                    break
+        for f_i in range(nf):
+            feedback = None
+            if mode == "critique+refine":
+                feedback = model.generate_feedback(task, current_program, temperature=0)
 
-                feedback = None
+            for r_i in range(nr):
+                repair_num = r_i + 1
+                print(f"  Feedback {f_i+1}, Repair {repair_num} → ", end="")
+
                 if mode == "critique+refine":
-                    feedback = model.generate_feedback(task, current_program, temperature=0)
+                    refined = model.refine(task, current_program, feedback, temperature=0)
+                elif mode == "direct":
+                    refined = model.refine(task, current_program, temperature=0)
+                else:
+                    raise ValueError("Unknown refinement mode")
 
-                for r_i in range(1, nr + 1):
-                    if attempt_count >= max_attempts:
-                        break
+                code = extract_code(refined)
+                frac_passed, results = test_suite(code)
+                fully_passed = frac_passed == 1.0
+                print(f"✅ success ({frac_passed*100:.1f}%)" if fully_passed else f"failed ({frac_passed*100:.1f}%)")
 
-                    attempt_count += 1
-                    print(f"  Attempt {attempt_count} (feedback {f_i+1}, repair {r_i}) → ", end="")
+                trajectory["feedback_repairs"].append({
+                    "feedback_index": f_i + 1,
+                    "repair_index": repair_num,
+                    "feedback": feedback,
+                    "program": code,
+                    "pass_fraction": frac_passed,
+                    "test_results": results,
+                    "passed": fully_passed
+                })
 
-                    if mode == "critique+refine":
-                        refined = model.refine(task, current_program, feedback, temperature=0)
-                    elif mode == "direct":
-                        refined = model.refine(task, current_program, temperature=0)
-                    else:
-                        raise ValueError("Unknown refinement mode")
-
-                    code = extract_code(refined)
-                    frac_passed, results = test_suite(code)
-                    fully_passed = frac_passed == 1.0
-
-                    trajectory["attempts"].append({
-                        "attempt": attempt_count,
-                        "feedback_index": f_i + 1,
-                        "repair_index": r_i,
-                        "feedback": feedback,
-                        "program": code,
-                        "pass_fraction": frac_passed,
-                        "test_results": results,
-                        "passed": fully_passed
-                    })
-
-                    print(f"✅ success ({frac_passed*100:.1f}%)" if fully_passed else f"failed ({frac_passed*100:.1f}%)")
-
-                    if fully_passed:
-                        seed_success = True
-                        success = True
-                        print(f"  ✅ Seed {i} succeeded after {attempt_count} attempts")
-                        break
-
-                    current_program = code  # next repair builds on last attempt
-
-                if seed_success:
+                current_program = code
+                if fully_passed:
+                    success = True
+                    print(f"  ✅ Seed {i} succeeded after feedback {f_i+1}, repair {r_i+1}")
                     break
+            if fully_passed:
+                break
 
     # ---------- Stage 3: Return aggregated results ----------
-    total_programs = sum(1 + len(t["attempts"]) for t in trajectories)
+    total_programs = np * (1 + nf * nr)
 
     return {
         "task_id": task,
