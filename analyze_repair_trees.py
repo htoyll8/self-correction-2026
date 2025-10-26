@@ -2,6 +2,7 @@ import json
 import math
 import numpy as np
 from collections import defaultdict
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 def pass_at_k(n, c, k):
@@ -13,7 +14,7 @@ def pass_at_k(n, c, k):
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
-def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False):
+def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False, extract_keywords=True):
     all_objects = []
     with open(path, "r") as f:
         for line in f:
@@ -31,75 +32,104 @@ def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False):
     iteration_passes = defaultdict(list)
     all_feedback = []
 
+    # ---------- Aggregate all feedback and pass@k ----------
     for obj in all_objects:
         trajectories = obj["trajectories"]
         n = len(trajectories)
-        c = sum(
-            t["initial_passed"] or any(r["passed"] for r in t.get("feedback_repairs", []))
-            for t in trajectories
-        )
 
-        # --- Pass@k per task ---
+        # --- Detect which schema we’re dealing with ---
+        mode = "iterative" if any("refinement_attempts" in t for t in trajectories) else "standard"
+
+        # --- Compute success counts (c) for pass@k ---
+        if mode == "standard":
+            c = sum(
+                t["initial_passed"] or any(r["passed"] for r in t.get("feedback_repairs", []))
+                for t in trajectories
+            )
+        else:  # iterative mode
+            c = sum(
+                t["initial_passed"] or any(r["passed"] for r in t.get("refinement_attempts", []))
+                for t in trajectories
+            )
+
         for k in k_values:
             pass_k_totals[k].append(pass_at_k(n, c, k))
 
+        # --- Aggregate iteration-level pass fractions ---
         for traj in trajectories:
             iteration_passes[0].append(traj.get("initial_pass_fraction", 0.0))
             initial_passes.append(traj["initial_passed"])
 
-            # --- Handle feedback/repairs ---
-            for idx, repair in enumerate(traj.get("feedback_repairs", []), start=1):
-                iteration_passes[idx].append(repair.get("pass_fraction", 0.0))
+            if mode == "standard":
+                attempts = traj.get("feedback_repairs", [])
+            else:
+                attempts = traj.get("refinement_attempts", [])
 
+            for idx, repair in enumerate(attempts, start=1):
+                iteration_passes[idx].append(repair.get("pass_fraction", 0.0))
                 feedback = repair.get("feedback")
                 if feedback:
                     all_feedback.append({
                         "task_id": obj["task_id"],
                         "seed_index": traj.get("seed_index"),
-                        "feedback_index": repair.get("feedback_index"),
-                        "repair_index": repair.get("repair_index"),
+                        "iteration": idx,
                         "feedback": feedback.strip()
                     })
 
             if not traj["initial_passed"]:
-                repairs.append(len(traj.get("feedback_repairs", [])))
+                repairs.append(len(attempts))
 
-    # --- Summary stats ---
+    # ---------- Summary Stats ----------
     frac_initial_passed = np.mean(initial_passes)
     frac_required_repair = 1 - frac_initial_passed
-    mean_repairs = np.mean(repairs) if repairs else 0
-    median_repairs = np.median(repairs) if repairs else 0
+    mean_attempts = np.mean(repairs) if repairs else 0
+    median_attempts = np.median(repairs) if repairs else 0
 
     print("\n📊 Summary Metrics")
     print(f"Unique tasks: {num_tasks}")
     print(f"Fraction passed initially: {frac_initial_passed:.2f}")
     print(f"Fraction required repair: {frac_required_repair:.2f}")
-    print(f"Mean repairs (failed seeds): {mean_repairs:.2f}")
-    print(f"Median repairs (failed seeds): {median_repairs:.2f}")
+    print(f"Mean attempts (failed seeds): {mean_attempts:.2f}")
+    print(f"Median attempts (failed seeds): {median_attempts:.2f}")
 
     print("\n✅ Pass@k:")
     for k in k_values:
         mean_passk = np.mean(pass_k_totals[k])
         print(f"  pass@{k:<2}: {mean_passk:.3f}")
 
+    # ---------- Per-iteration performance ----------
     print("\n📈 Average Percentage Passed per Iteration:")
     for iteration in sorted(iteration_passes.keys()):
         avg_frac = np.mean(iteration_passes[iteration])
-        print(f"  Iteration {iteration:<2}: {avg_frac*100:.2f}% ({len(iteration_passes[iteration])} programs)")
+        label = "Initial" if iteration == 0 else f"Refinement {iteration}"
+        print(f"  {label:<12}: {avg_frac*100:.2f}% ({len(iteration_passes[iteration])} programs)")
 
-    # --- Optional: print feedback neatly ---
-    if show_feedback:
+    # ---------- Feedback Summary ----------
+    if show_feedback and all_feedback:
         print("\n🧠 Extracted Feedback Messages:")
-        for fb in all_feedback:
+        for fb in all_feedback[:10]:  # show only first 10 for brevity
             print("=" * 80)
-            print(f"Task {fb['task_id']} | Seed {fb['seed_index']} | Feedback #{fb['feedback_index']} | Repair #{fb['repair_index']}")
+            print(f"Task {fb['task_id']} | Seed {fb['seed_index']} | Iteration {fb['iteration']}")
             print("-" * 80)
             print(fb['feedback'])
             print()
+
+    # ---------- Optional Keyword Extraction ----------
+    if extract_keywords and all_feedback:
+        texts = [f["feedback"] for f in all_feedback]
+        vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=20)
+        X = vectorizer.fit_transform(texts)
+        scores = np.asarray(X.mean(axis=0)).ravel()
+        terms = vectorizer.get_feature_names_out()
+
+        print("\n🧩 Top Keywords and Phrases in Feedback:")
+        top_indices = np.argsort(scores)[::-1][:20]
+        for i, idx in enumerate(top_indices, start=1):
+            print(f"  {i:>2}. {terms[idx]:<30} ({scores[idx]:.2f})")
 
     return all_feedback
 
 
 if __name__ == "__main__":
-    path = "results/results_gpt-4o-mini_mbpp_2025-10-24_11-53-40.jsonl"
-    analyze_repair_results(path, show_feedback=True)
+    path = "results/results_gpt-4o-mini_mbpp_2025-10-24_13-36-04.jsonl"
+    analyze_repair_results(path, show_feedback=False)
