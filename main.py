@@ -19,7 +19,7 @@ def extract_function_name_from_code(code: str) -> str | None:
     return match.group(1) if match else None
 
 
-def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
+def run_self_repair(task, model, test_suite, np=5,
                     nf=1, nr=1, mode="critique+refine"):
     """
     task: natural-language description of the problem
@@ -107,6 +107,105 @@ def run_self_repair(task, model, test_suite, np=5, max_attempts=10,
     return {
         "task_id": task,
         "success": success,
+        "trajectories": trajectories,
+        "k": total_programs
+    }
+
+
+def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mode="critique+refine"):
+    """
+    Perform iterative self-repair with multiple independent seeds (np).
+    Each seed is refined iteratively until success or reaching max_attempts.
+
+    Args:
+        task: str — natural-language description of the problem
+        model: Model — code-generation LLM interface
+        test_suite: callable(program_code) -> (frac_passed, results)
+        np: int — number of initial seed programs
+        max_attempts: int — maximum repair attempts per seed
+        mode: str — "critique+refine" (generate feedback before each fix) or "direct" (refine without feedback)
+
+    Returns:
+        dict summarizing all seed trajectories.
+    """
+
+    trajectories = []
+    overall_success = False
+
+    # ---------- Stage 1: Initial generation ----------
+    seeds = model.generate(task_description=task, n=np, temperature=0.7)
+
+    for i, seed in enumerate(seeds, start=1):
+        seed_code = extract_code(seed)
+        frac_passed, results = test_suite(seed_code)
+        print(f"Seed {i} → passed {frac_passed*100:.1f}% of tests")
+
+        fully_passed = frac_passed == 1.0
+        trajectory = {
+            "seed_index": i,
+            "initial_program": seed_code,
+            "initial_passed": fully_passed,
+            "initial_pass_fraction": frac_passed,
+            "initial_test_results": results,
+            "refinement_attempts": []
+        }
+        trajectories.append(trajectory)
+
+        if fully_passed:
+            overall_success = True
+            continue
+
+        current_program = seed_code
+        attempt_count = 0
+        seed_success = False
+
+        # ---------- Stage 2: Iterative refinement ----------
+        while attempt_count < max_attempts and not seed_success:
+            attempt_count += 1
+            print(f"  Seed {i}, Attempt {attempt_count} → ", end="")
+
+            feedback = None
+            if mode == "critique+refine":
+                feedback = model.generate_feedback(task, current_program, temperature=0)
+
+            if mode == "critique+refine":
+                refined = model.refine(task, current_program, feedback, temperature=0)
+            elif mode == "direct":
+                refined = model.refine(task, current_program, temperature=0)
+            else:
+                raise ValueError("Unknown refinement mode")
+
+            code = extract_code(refined)
+            frac_passed, results = test_suite(code)
+            fully_passed = frac_passed == 1.0
+
+            print(f"✅ success ({frac_passed*100:.1f}%)"
+                  if fully_passed else f"failed ({frac_passed*100:.1f}%)")
+
+            trajectory["refinement_attempts"].append({
+                "attempt": attempt_count,
+                "feedback": feedback,
+                "program": code,
+                "pass_fraction": frac_passed,
+                "test_results": results,
+                "passed": fully_passed
+            })
+
+            current_program = code
+            if fully_passed:
+                seed_success = True
+                overall_success = True
+                print(f"  ✅ Seed {i} succeeded after {attempt_count} attempts")
+
+        if not seed_success:
+            print(f"  ❌ Seed {i} exhausted {max_attempts} attempts without success")
+
+    # ---------- Stage 3: Return aggregated results ----------
+    total_programs = sum(1 + len(t["refinement_attempts"]) for t in trajectories)
+
+    return {
+        "task_id": task,
+        "success": overall_success,
         "trajectories": trajectories,
         "k": total_programs
     }
@@ -227,6 +326,12 @@ def main():
         default=None,   # if not provided, we’ll run all tasks
         help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35"
     )
+    parser.add_argument(
+        "--mode",
+        choices=["standard", "iterative"],
+        default="standard",
+        help="Choose repair strategy: 'standard' (nf/nr loops) or 'iterative' (rolling self-correction)"
+    )
     args = parser.parse_args()
 
     model = Model(model_name=args.model_name, temperature=args.temperature)
@@ -252,15 +357,24 @@ def main():
                 desc += f"\n\nThe function should be named `{func_name}`."
 
             test_suite = make_mbpp_test_suite(setup, tests)
-            result = run_self_repair(
-                task=desc,
-                model=model,
-                test_suite=test_suite,
-                np=args.np,
-                nf=args.nf,
-                nr=args.nr,
-                max_attempts=args.max_attempts
-            )
+            if args.mode == "iterative":
+                result = run_self_repair_iterative(
+                    task=desc,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    max_attempts=args.max_attempts,
+                    mode="critique+refine"
+                )
+            else:
+                result = run_self_repair(
+                    task=desc,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    nf=args.nf,
+                    nr=args.nr,
+                )
             result["dataset"] = "mbpp"
             result["task_id"] = task_id
             results.append(result)
@@ -279,15 +393,24 @@ def main():
                     ex["entry_point"]
                 )
             test_suite = make_humaneval_test_suite(tests, entry_point)
-            result = run_self_repair(
-                task=prompt,
-                model=model,
-                test_suite=test_suite,
-                np=args.np,
-                nf=args.nf,
-                nr=args.nr,
-                max_attempts=args.max_attempts
-            )
+            if args.mode == "iterative":
+                result = run_self_repair_iterative(
+                    task=prompt,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    max_attempts=args.max_attempts,
+                    mode="critique+refine"
+                )
+            else:
+                result = run_self_repair(
+                    task=prompt,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    nf=args.nf,
+                    nr=args.nr,
+                )
             result["dataset"] = "humaneval"
             result["task_id"] = task_id
             results.append(result)
