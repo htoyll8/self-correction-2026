@@ -14,7 +14,50 @@ def pass_at_k(n, c, k):
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
-def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False, extract_keywords=True):
+def compare_success_vs_failure(all_objects):
+    """Compare properties of successful, failed, and recovered repair trajectories."""
+
+    success_pass_fracs, fail_pass_fracs, recovered_pass_fracs = [], [], []
+    success_attempts, fail_attempts, recovered_attempts = [], [], []
+
+    for obj in all_objects:
+        for traj in obj.get("trajectories", []):
+            refinements = traj.get("refinement_attempts", []) or traj.get("feedback_repairs", [])
+            passed = traj["initial_passed"] or any(r.get("passed") for r in refinements)
+            recovered = (not traj["initial_passed"]) and any(r.get("passed") for r in refinements)
+
+            pass_fracs = [traj.get("initial_pass_fraction", 0.0)] + [
+                r.get("pass_fraction", 0.0) for r in refinements
+            ]
+            n_attempts = len(refinements)
+
+            if recovered:
+                recovered_pass_fracs.extend(pass_fracs)
+                recovered_attempts.append(n_attempts)
+            elif passed:
+                success_pass_fracs.extend(pass_fracs)
+                success_attempts.append(n_attempts)
+            else:
+                fail_pass_fracs.extend(pass_fracs)
+                fail_attempts.append(n_attempts)
+
+    def summarize(name, pass_fracs, attempts):
+        if not pass_fracs:
+            print(f"{name}: No data")
+            return
+        print(f"\n{name}")
+        print(f"  Avg pass fraction: {np.mean(pass_fracs) * 100:.2f}%")
+        print(f"  Median pass fraction: {np.median(pass_fracs) * 100:.2f}%")
+        print(f"  Avg attempts: {np.mean(attempts):.2f}")
+        print(f"  Median attempts: {np.median(attempts):.2f}")
+        print(f"  Count: {len(attempts)}")
+
+    summarize("✅ Successful trajectories (passed initially)", success_pass_fracs, success_attempts)
+    summarize("🔁 Recovered trajectories (failed initially but later succeeded)", recovered_pass_fracs, recovered_attempts)
+    summarize("❌ Failed trajectories (never passed)", fail_pass_fracs, fail_attempts)
+
+
+def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=True, extract_keywords=True):
     all_objects = []
     with open(path, "r") as f:
         for line in f:
@@ -30,6 +73,7 @@ def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False, extra
     initial_passes, repairs = [], []
     pass_k_totals = {k: [] for k in k_values}
     iteration_passes = defaultdict(list)
+    failed_only_passes = defaultdict(list)
     all_feedback = []
 
     # ---------- Aggregate all feedback and pass@k ----------
@@ -76,7 +120,13 @@ def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False, extra
                         "feedback": feedback.strip()
                     })
 
-            if not traj["initial_passed"]:
+            # if not traj["initial_passed"]:
+            #     repairs.append(len(attempts))
+
+            if traj.get("initial_pass_fraction", 0.0) < 1.0:
+                failed_only_passes[0].append(traj.get("initial_pass_fraction", 0.0))
+                for idx, attempt in enumerate(attempts, start=1):
+                    failed_only_passes[idx].append(attempt.get("pass_fraction", 0.0))
                 repairs.append(len(attempts))
 
     # ---------- Summary Stats ----------
@@ -104,6 +154,13 @@ def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False, extra
         label = "Initial" if iteration == 0 else f"Refinement {iteration}"
         print(f"  {label:<12}: {avg_frac*100:.2f}% ({len(iteration_passes[iteration])} programs)")
 
+    # ---------- Average % passed per iteration (failed seeds only) ----------
+    print("\n📊 Average Percentage of Tests Passed (Failed Seeds Only):")
+    for iteration in sorted(failed_only_passes.keys()):
+        avg_frac = np.mean(failed_only_passes[iteration]) if failed_only_passes[iteration] else 0
+        label = "Initial" if iteration == 0 else f"Refinement {iteration}"
+        print(f"  {label:<12}: {avg_frac*100:.2f}% ({len(failed_only_passes[iteration])} programs)")
+
     # ---------- Feedback Summary ----------
     if show_feedback and all_feedback:
         print("\n🧠 Extracted Feedback Messages:")
@@ -127,9 +184,11 @@ def analyze_repair_results(path, k_values=(1, 5, 10), show_feedback=False, extra
         for i, idx in enumerate(top_indices, start=1):
             print(f"  {i:>2}. {terms[idx]:<30} ({scores[idx]:.2f})")
 
+    compare_success_vs_failure(all_objects)
+
     return all_feedback
 
 
 if __name__ == "__main__":
-    path = "results/results_gpt-4o-mini_mbpp_2025-10-24_13-36-04.jsonl"
+    path = "results/results_gpt-4o-mini_humaneval_2025-10-27_03-52-26_final.jsonl"
     analyze_repair_results(path, show_feedback=False)
