@@ -1,6 +1,11 @@
 import re
+import os
 import json
+import time
 import argparse
+import traceback
+import tempfile
+import subprocess
 import traceback
 from tqdm import tqdm
 from datetime import datetime
@@ -260,36 +265,26 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
     return test_suite
 
 
-def make_humaneval_test_suite(tests: str, entry_point: str):
+def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
+    print(f"[DEBUG] make_humaneval_test_suite initialized with language={language}")
     """
-    Returns a callable test function that executes HumanEval-style tests.
-    Reports both the fraction of passed test cases and a summary of outcomes.
+    Returns a callable test function that executes HumanEval-X style tests
+    for Python, C++, Java, Go, or JS programs.
     """
-    def test_suite(program_code: str):
+    def run_python(program_code: str):
         env = {}
         try:
-            # Load the candidate program
             exec(program_code, env)
-
             if entry_point not in env:
-                print(f"[Error] Function '{entry_point}' not defined.")
-                return 0.0, []
-
+                return 0.0, [("[Error]", f"Function '{entry_point}' not defined")]
             candidate = env[entry_point]
 
-            # Extract assert lines safely
             assert_lines = [
-                line.strip()
-                for line in tests.splitlines()
+                line.strip() for line in tests.splitlines()
                 if line.strip().startswith("assert ")
             ]
-            total = len(assert_lines)
-            passed = 0
-            results = []
-
-            # Execute each assertion individually
+            total, passed, results = len(assert_lines), 0, []
             for i, assert_line in enumerate(assert_lines, 1):
-                # Example: assert candidate([1, 2, 3], 0.5) == True
                 try:
                     exec(assert_line, {**env, "candidate": candidate})
                     passed += 1
@@ -299,12 +294,97 @@ def make_humaneval_test_suite(tests: str, entry_point: str):
                 except Exception as e:
                     tb = traceback.format_exception_only(type(e), e)[0].strip()
                     results.append((i, f"⚠️ ERROR: {tb}", assert_line))
-
-            fraction = passed / total if total > 0 else 0.0
-            return fraction, results
-
+            return (passed / total if total else 0.0), results
         except Exception as e:
-            print(f"[Fatal Error] {e}")
+            return 0.0, [("[Fatal]", str(e))]
+
+    def run_cpp(program_code: str):
+        print("\n[DEBUG] Running C++ test suite")
+
+        # Remove the "cpp" language tag if present
+        program_code = program_code.strip()
+        first_line = program_code.splitlines()[0].strip().lower()
+        if first_line in {"cpp", "c++"}:
+            print(f"[DEBUG] Removing leading language tag: {first_line}")
+            program_code = "\n".join(program_code.splitlines()[1:])
+
+        full_code = f"{program_code}\n\n{tests}"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cpp_path = os.path.join(tmpdir, "solution.cpp")
+            bin_path = os.path.join(tmpdir, "solution.out")
+
+            # Write combined code
+            with open(cpp_path, "w") as f:
+                f.write(full_code)
+
+            print(f"[DEBUG] Final C++ file written to: {cpp_path}")
+
+            # Compile command
+            compile_cmd = [
+                "g++", "-std=c++17", cpp_path, "-o", bin_path,
+                "-I", "/opt/homebrew/include",
+                "-L", "/opt/homebrew/lib",
+                "-lboost_system", "-lboost_filesystem",
+                "-lssl", "-lcrypto"
+            ]
+            compile_result = subprocess.run(compile_cmd, capture_output=True, text=True)
+
+            print("[DEBUG] Compilation return code:", compile_result.returncode)
+            if compile_result.returncode != 0:
+                print("[DEBUG] ❌ Compilation failed:")
+                print(compile_result.stderr)
+                return 0.0, [("❌ COMPILE ERROR", compile_result.stderr.strip())]
+
+            # Run binary
+            start = time.time()
+            run_result = subprocess.run([bin_path], capture_output=True, text=True)
+            elapsed = time.time() - start
+
+            print(f"[DEBUG] Runtime: {elapsed:.2f}s, Return code: {run_result.returncode}")
+            print("[DEBUG] Stdout:", run_result.stdout.strip())
+            print("[DEBUG] Stderr:", run_result.stderr.strip())
+
+            if run_result.returncode == 0:
+                return 1.0, [("✅ PASS", run_result.stdout.strip() or "All tests passed.")]
+            else:
+                return 0.0, [("❌ RUNTIME ERROR", run_result.stderr.strip() or run_result.stdout.strip())]
+
+    def run_java(program_code: str):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "Main.java")
+            test_code = (
+                "public class Main {\n"
+                f"{program_code}\n"
+                "public static void main(String[] args) {\n"
+                f"{tests}\nSystem.out.println(\"ALL TESTS PASSED\");\n}}\n"
+            )
+            with open(src_path, "w") as f:
+                f.write(test_code)
+
+            compile_result = subprocess.run(
+                ["javac", src_path], capture_output=True, text=True
+            )
+            if compile_result.returncode != 0:
+                return 0.0, [("❌ COMPILE ERROR", compile_result.stderr.strip())]
+
+            run_result = subprocess.run(
+                ["java", "-cp", tmpdir, "Main"], capture_output=True, text=True
+            )
+            if run_result.returncode == 0:
+                return 1.0, [("✅ PASS", run_result.stdout.strip())]
+            else:
+                return 0.0, [("❌ RUNTIME ERROR", run_result.stderr.strip())]
+
+    def test_suite(program_code: str):
+        if language == "python":
+            return run_python(program_code)
+        elif language == "cpp":
+            return run_cpp(program_code)
+        elif language == "java":
+            return run_java(program_code)
+        else:
+            print(f"[Warning] Language {language} not supported yet.")
             return 0.0, []
 
     return test_suite
@@ -312,7 +392,11 @@ def make_humaneval_test_suite(tests: str, entry_point: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Run self-repair on MBPP or HumanEval.")
-    parser.add_argument("--dataset", choices=["mbpp", "humaneval"], required=True)
+    parser.add_argument(
+        "--dataset",
+        choices=["mbpp", "humaneval", "humaneval-x"],
+        required=True
+    )
     parser.add_argument("--np", type=int, default=5, help="Number of seeds")
     parser.add_argument("--nf", type=int, default=1, help="Feedback per failed program")
     parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
@@ -320,6 +404,12 @@ def main():
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tasks", type=int, default=None, help="Limit tasks for debugging")
+    parser.add_argument(
+        "--language",
+        choices=["python", "cpp", "java", "go", "js"],
+        default="python",
+        help="Language subset for HumanEval-X (ignored for MBPP and standard HumanEval)."
+    )
     parser.add_argument(
         "--task_ids",
         nargs="+",
@@ -412,6 +502,49 @@ def main():
                     nr=args.nr,
                 )
             result["dataset"] = "humaneval"
+            result["task_id"] = task_id
+            results.append(result)
+
+    elif args.dataset == "humaneval-x":
+        ds = load_dataset("THUDM/humaneval-x", args.language)["test"]
+        selected = ds if args.task_ids is None else [ex for ex in ds if ex["task_id"] in args.task_ids]
+        print(f"Loaded HumanEval-X ({args.language}) with {len(selected)} test tasks.")
+
+        for i, ex in enumerate(tqdm(selected, desc=f"Running HumanEval-X ({args.language}) tasks")):
+            if args.max_tasks and i >= args.max_tasks:
+                break
+
+            task_id, prompt, declaration, ref_code, tests = (
+                ex["task_id"],
+                ex["prompt"],
+                ex["declaration"],
+                ex["canonical_solution"],
+                ex["test"]
+            )
+
+            test_suite = make_humaneval_test_suite(tests, declaration, language=args.language)
+
+            # Run repair depending on mode
+            if args.mode == "iterative":
+                result = run_self_repair_iterative(
+                    task=prompt,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    max_attempts=args.max_attempts,
+                    mode="critique+refine"
+                )
+            else:
+                result = run_self_repair(
+                    task=prompt,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    nf=args.nf,
+                    nr=args.nr,
+                )
+
+            result["dataset"] = f"humaneval-x-{args.language}"
             result["task_id"] = task_id
             results.append(result)
 
