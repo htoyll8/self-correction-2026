@@ -308,6 +308,15 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
             print(f"[DEBUG] Removing leading language tag: {first_line}")
             program_code = "\n".join(program_code.splitlines()[1:])
 
+        program_code = re.sub(
+            r'\bint\s+main\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*\}',
+            '',
+            program_code,
+            flags=re.DOTALL
+        )
+        print("[DEBUG] After main() cleanup, snippet:")
+        print("\n".join(program_code.splitlines()[-10:]))  # last 10 lines
+
         full_code = f"{program_code}\n\n{tests}"
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -319,14 +328,9 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
                 f.write(full_code)
 
             print(f"[DEBUG] Final C++ file written to: {cpp_path}")
-
             # Compile command
             compile_cmd = [
-                "g++", "-std=c++17", cpp_path, "-o", bin_path,
-                "-I", "/opt/homebrew/include",
-                "-L", "/opt/homebrew/lib",
-                "-lboost_system", "-lboost_filesystem",
-                "-lssl", "-lcrypto"
+                "g++", "-std=c++17", cpp_path, "-o", bin_path
             ]
             compile_result = subprocess.run(compile_cmd, capture_output=True, text=True)
 
