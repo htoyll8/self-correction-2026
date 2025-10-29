@@ -309,29 +309,62 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
             program_code = "\n".join(program_code.splitlines()[1:])
 
         program_code = re.sub(
-            r'\bint\s+main\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*\}',
+            r'\bint\s+main\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*\}', 
             '',
             program_code,
             flags=re.DOTALL
         )
-        print("[DEBUG] After main() cleanup, snippet:")
-        print("\n".join(program_code.splitlines()[-10:]))  # last 10 lines
 
-        full_code = f"{program_code}\n\n{tests}"
+        # --------------------------------------------------------------------------
+        def wrap_asserts_with_check(test_code: str) -> str:
+            # Replace every `assert(expr);` with `CHECK(expr);`
+            test_code = re.sub(r'\bassert\s*\((.*?)\);', r'CHECK(\1);', test_code)
+
+            # Define header and footer instrumentation
+            header = r"""
+        #include <iostream>
+        int passed_tests = 0;
+        int total_tests = 0;
+
+        #define CHECK(expr) do { \
+            ++total_tests; \
+            if (expr) { ++passed_tests; } \
+            else { std::cerr << "❌ FAIL: " #expr << std::endl; } \
+        } while(0)
+        """
+            # Append reporting line at the end of main()
+            footer = r"""
+        std::cout << "PASS FRACTION: " 
+                << (100.0 * passed_tests / total_tests) 
+                << "%" << std::endl;
+        return 0;
+        }
+        """
+
+            # Insert the footer just before the closing brace of main()
+            test_code = re.sub(r'\}\s*$', footer, test_code.strip())
+
+            # Prepend the header
+            return header + "\n" + test_code
+        # --------------------------------------------------------------------------
+
+        instrumented_tests = wrap_asserts_with_check(tests)
+        print(f"Tests: {instrumented_tests}")
+        full_code = f"{program_code}\n\n{instrumented_tests}"
+        print("[DEBUG] File head preview:")
+        # print("\n".join(full_code.splitlines()[:10]))
+        print(full_code)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cpp_path = os.path.join(tmpdir, "solution.cpp")
             bin_path = os.path.join(tmpdir, "solution.out")
 
-            # Write combined code
             with open(cpp_path, "w") as f:
                 f.write(full_code)
 
             print(f"[DEBUG] Final C++ file written to: {cpp_path}")
-            # Compile command
-            compile_cmd = [
-                "g++", "-std=c++17", cpp_path, "-o", bin_path
-            ]
+
+            compile_cmd = ["g++", "-std=c++17", cpp_path, "-o", bin_path]
             compile_result = subprocess.run(compile_cmd, capture_output=True, text=True)
 
             print("[DEBUG] Compilation return code:", compile_result.returncode)
@@ -340,7 +373,6 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
                 print(compile_result.stderr)
                 return 0.0, [("❌ COMPILE ERROR", compile_result.stderr.strip())]
 
-            # Run binary
             start = time.time()
             run_result = subprocess.run([bin_path], capture_output=True, text=True)
             elapsed = time.time() - start
@@ -349,10 +381,17 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
             print("[DEBUG] Stdout:", run_result.stdout.strip())
             print("[DEBUG] Stderr:", run_result.stderr.strip())
 
-            if run_result.returncode == 0:
-                return 1.0, [("✅ PASS", run_result.stdout.strip() or "All tests passed.")]
+            # Parse PASS FRACTION if present
+            match = re.search(r'PASS FRACTION:\s*([\d.]+)%', run_result.stdout)
+            if match:
+                pass_fraction = float(match.group(1)) / 100.0
             else:
-                return 0.0, [("❌ RUNTIME ERROR", run_result.stderr.strip() or run_result.stdout.strip())]
+                pass_fraction = 1.0 if run_result.returncode == 0 else 0.0
+
+            if run_result.returncode == 0:
+                return pass_fraction, [("✅ PASS", run_result.stdout.strip() or "All tests passed.")]
+            else:
+                return pass_fraction, [("❌ RUNTIME ERROR", run_result.stderr.strip() or run_result.stdout.strip())]
 
     def run_java(program_code: str):
         with tempfile.TemporaryDirectory() as tmpdir:
