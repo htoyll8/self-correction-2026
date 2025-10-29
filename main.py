@@ -2,6 +2,7 @@ import re
 import os
 import json
 import time
+import signal
 import argparse
 import traceback
 import tempfile
@@ -265,12 +266,60 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
     return test_suite
 
 
-def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
+def make_apps_test_suite(inputs, outputs, timeout_seconds=10):
+    """
+    Returns a callable test function that runs an APPS-style program.
+    Each input is fed via stdin, and stdout is compared to expected output.
+    """
+    def run(program_code: str):
+        results, passed = [], 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "main.py")
+            with open(src_path, "w") as f:
+                f.write(program_code)
+
+            for j, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                try:
+                    proc = subprocess.run(
+                        ["python3", src_path],
+                        input=inp.encode(),
+                        capture_output=True,
+                        timeout=timeout_seconds,
+                    )
+                    pred = proc.stdout.decode().strip()
+                    gold = out.strip()
+                    if pred == gold:
+                        passed += 1
+                        results.append((j, "✅ PASS", inp.strip()))
+                    else:
+                        results.append((j, "❌ FAIL", f"Expected: {gold!r}, Got: {pred!r}"))
+                except subprocess.TimeoutExpired:
+                    results.append((j, f"TIMEOUT (> {timeout_seconds}s)", inp.strip()))
+                except Exception as e:
+                    results.append((j, f"⚠️ ERROR: {e}", inp.strip()))
+
+        total = len(inputs)
+        return (passed / total if total else 0.0), results
+
+    return run
+
+
+def make_humaneval_test_suite(tests: str, entry_point: str, language="python", timeout_seconds=10):
     print(f"[DEBUG] make_humaneval_test_suite initialized with language={language}")
-    """
-    Returns a callable test function that executes HumanEval-X style tests
-    for Python, C++, Java, Go, or JS programs.
-    """
+
+    # -----------------------------
+    # Helper: Timeout for Python code
+    # -----------------------------
+    class TimeoutException(Exception):
+        pass
+
+    def timeout_handler(signum, frame):
+        raise TimeoutException("Execution timed out")
+
+    # -----------------------------
+    # PYTHON
+    # -----------------------------
     def run_python(program_code: str):
         env = {}
         try:
@@ -284,24 +333,39 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
                 if line.strip().startswith("assert ")
             ]
             total, passed, results = len(assert_lines), 0, []
+
+            signal.signal(signal.SIGALRM, timeout_handler)
+
             for i, assert_line in enumerate(assert_lines, 1):
                 try:
+                    signal.alarm(timeout_seconds)
                     exec(assert_line, {**env, "candidate": candidate})
+                    signal.alarm(0)
                     passed += 1
                     results.append((i, "✅ PASS", assert_line))
+                except TimeoutException:
+                    results.append((i, f"TIMEOUT (> {timeout_seconds}s)", assert_line))
+                    signal.alarm(0)
                 except AssertionError:
                     results.append((i, "❌ FAIL", assert_line))
+                    signal.alarm(0)
                 except Exception as e:
                     tb = traceback.format_exception_only(type(e), e)[0].strip()
                     results.append((i, f"⚠️ ERROR: {tb}", assert_line))
+                    signal.alarm(0)
+
+            signal.alarm(0)
             return (passed / total if total else 0.0), results
+
         except Exception as e:
             return 0.0, [("[Fatal]", str(e))]
 
+    # -----------------------------
+    # C++
+    # -----------------------------
     def run_cpp(program_code: str):
         print("\n[DEBUG] Running C++ test suite")
 
-        # Remove the "cpp" language tag if present
         program_code = program_code.strip()
         first_line = program_code.splitlines()[0].strip().lower()
         if first_line in {"cpp", "c++"}:
@@ -309,51 +373,36 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
             program_code = "\n".join(program_code.splitlines()[1:])
 
         program_code = re.sub(
-            r'\bint\s+main\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*\}', 
+            r'\bint\s+main\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*\}',
             '',
             program_code,
             flags=re.DOTALL
         )
 
-        # --------------------------------------------------------------------------
         def wrap_asserts_with_check(test_code: str) -> str:
-            # Replace every `assert(expr);` with `CHECK(expr);`
             test_code = re.sub(r'\bassert\s*\((.*?)\);', r'CHECK(\1);', test_code)
-
-            # Define header and footer instrumentation
             header = r"""
-        #include <iostream>
-        int passed_tests = 0;
-        int total_tests = 0;
-
-        #define CHECK(expr) do { \
-            ++total_tests; \
-            if (expr) { ++passed_tests; } \
-            else { std::cerr << "❌ FAIL: " #expr << std::endl; } \
-        } while(0)
-        """
-            # Append reporting line at the end of main()
+#include <iostream>
+int passed_tests = 0;
+int total_tests = 0;
+#define CHECK(expr) do { \
+    ++total_tests; \
+    if (expr) { ++passed_tests; } \
+    else { std::cerr << "❌ FAIL: " #expr << std::endl; } \
+} while(0)
+"""
             footer = r"""
-        std::cout << "PASS FRACTION: " 
-                << (100.0 * passed_tests / total_tests) 
-                << "%" << std::endl;
-        return 0;
-        }
-        """
-
-            # Insert the footer just before the closing brace of main()
+std::cout << "PASS FRACTION: " 
+          << (100.0 * passed_tests / total_tests) 
+          << "%" << std::endl;
+return 0;
+}
+"""
             test_code = re.sub(r'\}\s*$', footer, test_code.strip())
-
-            # Prepend the header
             return header + "\n" + test_code
-        # --------------------------------------------------------------------------
 
         instrumented_tests = wrap_asserts_with_check(tests)
-        print(f"Tests: {instrumented_tests}")
         full_code = f"{program_code}\n\n{instrumented_tests}"
-        print("[DEBUG] File head preview:")
-        # print("\n".join(full_code.splitlines()[:10]))
-        print(full_code)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cpp_path = os.path.join(tmpdir, "solution.cpp")
@@ -362,37 +411,37 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
             with open(cpp_path, "w") as f:
                 f.write(full_code)
 
-            print(f"[DEBUG] Final C++ file written to: {cpp_path}")
-
             compile_cmd = ["g++", "-std=c++17", cpp_path, "-o", bin_path]
             compile_result = subprocess.run(compile_cmd, capture_output=True, text=True)
 
-            print("[DEBUG] Compilation return code:", compile_result.returncode)
             if compile_result.returncode != 0:
-                print("[DEBUG] ❌ Compilation failed:")
-                print(compile_result.stderr)
                 return 0.0, [("❌ COMPILE ERROR", compile_result.stderr.strip())]
 
-            start = time.time()
-            run_result = subprocess.run([bin_path], capture_output=True, text=True)
-            elapsed = time.time() - start
+            try:
+                start = time.time()
+                run_result = subprocess.run(
+                    [bin_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds
+                )
+                elapsed = time.time() - start
+            except subprocess.TimeoutExpired:
+                return 0.0, [("TIMEOUT", f"Execution exceeded {timeout_seconds}s")]
 
-            print(f"[DEBUG] Runtime: {elapsed:.2f}s, Return code: {run_result.returncode}")
-            print("[DEBUG] Stdout:", run_result.stdout.strip())
-            print("[DEBUG] Stderr:", run_result.stderr.strip())
-
-            # Parse PASS FRACTION if present
             match = re.search(r'PASS FRACTION:\s*([\d.]+)%', run_result.stdout)
-            if match:
-                pass_fraction = float(match.group(1)) / 100.0
-            else:
-                pass_fraction = 1.0 if run_result.returncode == 0 else 0.0
+            pass_fraction = float(match.group(1)) / 100.0 if match else (
+                1.0 if run_result.returncode == 0 else 0.0
+            )
 
             if run_result.returncode == 0:
                 return pass_fraction, [("✅ PASS", run_result.stdout.strip() or "All tests passed.")]
             else:
                 return pass_fraction, [("❌ RUNTIME ERROR", run_result.stderr.strip() or run_result.stdout.strip())]
 
+    # -----------------------------
+    # JAVA
+    # -----------------------------
     def run_java(program_code: str):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "Main.java")
@@ -411,14 +460,24 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
             if compile_result.returncode != 0:
                 return 0.0, [("❌ COMPILE ERROR", compile_result.stderr.strip())]
 
-            run_result = subprocess.run(
-                ["java", "-cp", tmpdir, "Main"], capture_output=True, text=True
-            )
+            try:
+                run_result = subprocess.run(
+                    ["java", "-cp", tmpdir, "Main"],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                return 0.0, [("TIMEOUT", f"Execution exceeded {timeout_seconds}s")]
+
             if run_result.returncode == 0:
                 return 1.0, [("✅ PASS", run_result.stdout.strip())]
             else:
                 return 0.0, [("❌ RUNTIME ERROR", run_result.stderr.strip())]
 
+    # -----------------------------
+    # TEST SUITE DISPATCHER
+    # -----------------------------
     def test_suite(program_code: str):
         if language == "python":
             return run_python(program_code)
@@ -435,7 +494,11 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
 
 def main():
     parser = argparse.ArgumentParser(description="Run self-repair on MBPP or HumanEval.")
-    parser.add_argument("--dataset", choices=["mbpp", "humaneval", "humaneval-x"], required=True)
+    parser.add_argument(
+        "--dataset",
+        choices=["mbpp", "humaneval", "humaneval-x", "apps"],
+        required=True
+    )
     parser.add_argument("--np", type=int, default=5, help="Number of seeds")
     parser.add_argument("--nf", type=int, default=1, help="Feedback per failed program")
     parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
@@ -559,7 +622,70 @@ def main():
             result["task_id"] = task_id
             write_result(result)
 
-    f.close()
+    elif args.dataset == "apps":
+        # ds = load_dataset("codeparrot/apps", split="test")
+        ds = load_dataset("codeparrot/apps", split="test[:200]")
+        selected = ds if args.task_ids is None else [
+            ex for ex in ds if str(ex["problem_id"]) in args.task_ids
+        ]
+        print(f"Loaded APPS with {len(selected)} test problems.")
+
+        for i, ex in enumerate(tqdm(selected, desc="Running APPS tasks")):
+            if args.max_tasks and i >= args.max_tasks:
+                break
+
+            problem_id = ex["problem_id"]
+            prompt = ex["question"]
+            difficulty = ex.get("difficulty", "unknown")
+
+            # Parse solutions and I/O pairs safely
+            try:
+                solutions = json.loads(ex.get("solutions", "[]"))
+            except Exception:
+                solutions = []
+
+            try:
+                io_pairs = json.loads(ex.get("input_output", "{}"))
+                inputs, outputs = io_pairs.get("inputs", []), io_pairs.get("outputs", [])
+            except Exception:
+                inputs, outputs = [], []
+
+            # Skip invalid or empty examples
+            if not inputs or not outputs:
+                print(f"[Warning] Skipping problem {problem_id} (no I/O pairs)")
+                continue
+
+            # Create APPS-style test suite (runs programs with stdin/stdout)
+            test_suite = make_apps_test_suite(inputs, outputs, timeout_seconds=10)
+
+            # Run repair depending on mode
+            if args.mode == "iterative":
+                result = run_self_repair_iterative(
+                    task=prompt,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    max_attempts=args.max_attempts,
+                    mode="critique+refine",
+                )
+            else:
+                result = run_self_repair(
+                    task=prompt,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    nf=args.nf,
+                    nr=args.nr,
+                )
+
+            result.update({
+                "dataset": "apps",
+                "problem_id": problem_id,
+                "difficulty": difficulty,
+            })
+            write_result(result)
+
+        f.close()
     print(f"\n✅ Completed {args.dataset}. Results streamed to {out_path}")
 
 
