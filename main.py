@@ -435,11 +435,7 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python"):
 
 def main():
     parser = argparse.ArgumentParser(description="Run self-repair on MBPP or HumanEval.")
-    parser.add_argument(
-        "--dataset",
-        choices=["mbpp", "humaneval", "humaneval-x"],
-        required=True
-    )
+    parser.add_argument("--dataset", choices=["mbpp", "humaneval", "humaneval-x"], required=True)
     parser.add_argument("--np", type=int, default=5, help="Number of seeds")
     parser.add_argument("--nf", type=int, default=1, help="Feedback per failed program")
     parser.add_argument("--nr", type=int, default=1, help="Repairs per feedback")
@@ -447,37 +443,40 @@ def main():
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tasks", type=int, default=None, help="Limit tasks for debugging")
-    parser.add_argument(
-        "--language",
-        choices=["python", "cpp", "java", "go", "js"],
-        default="python",
-        help="Language subset for HumanEval-X (ignored for MBPP and standard HumanEval)."
-    )
-    parser.add_argument(
-        "--task_ids",
-        nargs="+",
-        default=None,   # if not provided, we’ll run all tasks
-        help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35"
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["standard", "iterative"],
-        default="standard",
-        help="Choose repair strategy: 'standard' (nf/nr loops) or 'iterative' (rolling self-correction)"
-    )
+    parser.add_argument("--language", choices=["python", "cpp", "java", "go", "js"], default="python",
+                        help="Language subset for HumanEval-X (ignored for MBPP and standard HumanEval).")
+    parser.add_argument("--task_ids", nargs="+", default=None,
+                        help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35")
+    parser.add_argument("--mode", choices=["standard", "iterative"], default="standard",
+                        help="Choose repair strategy: 'standard' (nf/nr loops) or 'iterative' (rolling self-correction)")
     args = parser.parse_args()
 
     model = Model(model_name=args.model_name, temperature=args.temperature)
-    results = []
 
+    # ---------- Prepare output file early ----------
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out_path = f"results/results_{args.model_name}_{args.dataset}_{timestamp}.jsonl"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    f = open(out_path, "w", encoding="utf-8")
+
+    def write_result(result):
+        """Write one result to the file immediately and flush."""
+        json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())  # ensure data is physically written to disk
+
+    # ---------- Select dataset ----------
     if args.dataset == "mbpp":
         ds = load_dataset("Muennighoff/mbpp", "sanitized")["test"]
         selected = ds if args.task_ids is None else [ex for ex in ds if str(ex["task_id"]) in args.task_ids]
         print(f"Loaded MBPP with {len(selected)} test tasks.")
+
         for i, ex in enumerate(tqdm(selected, desc="Running MBPP tasks")):
             if args.max_tasks and i >= args.max_tasks:
                 break
-            task_id, desc, setup, tests, ref_code  = (
+
+            task_id, desc, setup, tests, ref_code = (
                 ex["task_id"],
                 ex["prompt"],
                 ex["test_imports"],
@@ -492,61 +491,43 @@ def main():
             test_suite = make_mbpp_test_suite(setup, tests)
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
-                    task=desc,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    max_attempts=args.max_attempts,
-                    mode="critique+refine"
+                    task=desc, model=model, test_suite=test_suite,
+                    np=args.np, max_attempts=args.max_attempts, mode="critique+refine"
                 )
             else:
                 result = run_self_repair(
-                    task=desc,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    nf=args.nf,
-                    nr=args.nr,
+                    task=desc, model=model, test_suite=test_suite,
+                    np=args.np, nf=args.nf, nr=args.nr
                 )
             result["dataset"] = "mbpp"
             result["task_id"] = task_id
-            results.append(result)
+            write_result(result)
 
     elif args.dataset == "humaneval":
         ds = load_dataset("openai/openai_humaneval")["test"]
         selected = ds if args.task_ids is None else [ex for ex in ds if ex["task_id"] in args.task_ids]
         print(f"Loaded HumanEval with {len(selected)} test tasks.")
+
         for i, ex in enumerate(tqdm(selected, desc="Running HumanEval tasks")):
             if args.max_tasks and i >= args.max_tasks:
                 break
             task_id, prompt, tests, entry_point = (
-                    ex["task_id"],
-                    ex["prompt"],
-                    ex["test"],
-                    ex["entry_point"]
-                )
+                ex["task_id"], ex["prompt"], ex["test"], ex["entry_point"]
+            )
             test_suite = make_humaneval_test_suite(tests, entry_point)
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
-                    task=prompt,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    max_attempts=args.max_attempts,
-                    mode="critique+refine"
+                    task=prompt, model=model, test_suite=test_suite,
+                    np=args.np, max_attempts=args.max_attempts, mode="critique+refine"
                 )
             else:
                 result = run_self_repair(
-                    task=prompt,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    nf=args.nf,
-                    nr=args.nr,
+                    task=prompt, model=model, test_suite=test_suite,
+                    np=args.np, nf=args.nf, nr=args.nr
                 )
             result["dataset"] = "humaneval"
             result["task_id"] = task_id
-            results.append(result)
+            write_result(result)
 
     elif args.dataset == "humaneval-x":
         ds = load_dataset("THUDM/humaneval-x", args.language)["test"]
@@ -556,51 +537,30 @@ def main():
         for i, ex in enumerate(tqdm(selected, desc=f"Running HumanEval-X ({args.language}) tasks")):
             if args.max_tasks and i >= args.max_tasks:
                 break
-
             task_id, prompt, declaration, ref_code, tests = (
-                ex["task_id"],
-                ex["prompt"],
-                ex["declaration"],
-                ex["canonical_solution"],
-                ex["test"]
+                ex["task_id"], ex["prompt"], ex["declaration"],
+                ex["canonical_solution"], ex["test"]
             )
 
             test_suite = make_humaneval_test_suite(tests, declaration, language=args.language)
 
-            # Run repair depending on mode
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
-                    task=prompt,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    max_attempts=args.max_attempts,
-                    mode="critique+refine"
+                    task=prompt, model=model, test_suite=test_suite,
+                    np=args.np, max_attempts=args.max_attempts, mode="critique+refine"
                 )
             else:
                 result = run_self_repair(
-                    task=prompt,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    nf=args.nf,
-                    nr=args.nr,
+                    task=prompt, model=model, test_suite=test_suite,
+                    np=args.np, nf=args.nf, nr=args.nr
                 )
 
             result["dataset"] = f"humaneval-x-{args.language}"
             result["task_id"] = task_id
-            results.append(result)
+            write_result(result)
 
-    # ---------- Save results ----------
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_path = f"results/results_{args.model_name}_{args.dataset}_{timestamp}.jsonl"
-    with open(out_path, "w") as f:
-        for r in results:
-            json.dump(r, f, ensure_ascii=False, separators=(",", ":"))
-            f.write("\n\n")
-
-    print(f"\n✅ Completed {len(results)} tasks from {args.dataset}.")
-    print(f"Results saved to {out_path}")
+    f.close()
+    print(f"\n✅ Completed {args.dataset}. Results streamed to {out_path}")
 
 
 if __name__ == "__main__":
