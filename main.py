@@ -11,6 +11,7 @@ import traceback
 from tqdm import tqdm
 from datetime import datetime
 from datasets import load_dataset
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from model import Model
 
@@ -120,33 +121,21 @@ def run_self_repair(task, model, test_suite, np=5,
 
 def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mode="critique+refine"):
     """
-    Perform iterative self-repair with multiple independent seeds (np).
-    Each seed is refined iteratively until success or reaching max_attempts.
-
-    Args:
-        task: str — natural-language description of the problem
-        model: Model — code-generation LLM interface
-        test_suite: callable(program_code) -> (frac_passed, results)
-        np: int — number of initial seed programs
-        max_attempts: int — maximum repair attempts per seed
-        mode: str — "critique+refine" (generate feedback before each fix) or "direct" (refine without feedback)
-
-    Returns:
-        dict summarizing all seed trajectories.
+    Perform iterative self-repair with multiple independent seeds (np),
+    refined in parallel using threads.
     """
-
     trajectories = []
     overall_success = False
 
-    # ---------- Stage 1: Initial generation ----------
+    # ---------- Stage 1: Generate seeds ----------
     seeds = model.generate(task_description=task, n=np, temperature=0.7)
 
-    for i, seed in enumerate(seeds, start=1):
+    def process_seed(i, seed):
+        """Process one seed end-to-end."""
         seed_code = extract_code(seed)
         frac_passed, results = test_suite(seed_code)
-        print(f"Seed {i} → passed {frac_passed*100:.1f}% of tests")
-
         fully_passed = frac_passed == 1.0
+
         trajectory = {
             "seed_index": i,
             "initial_program": seed_code,
@@ -155,38 +144,35 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
             "initial_test_results": results,
             "refinement_attempts": []
         }
-        trajectories.append(trajectory)
 
         if fully_passed:
-            overall_success = True
-            continue
+            print(f"Seed {i} ✅ passed all tests initially ({frac_passed*100:.1f}%)")
+            return trajectory, True
 
         current_program = seed_code
         attempt_count = 0
         seed_success = False
 
-        # ---------- Stage 2: Iterative refinement ----------
         while attempt_count < max_attempts and not seed_success:
             attempt_count += 1
             print(f"  Seed {i}, Attempt {attempt_count} → ", end="")
 
             feedback = None
             if mode == "critique+refine":
-                feedback = model.generate_feedback(task, current_program, temperature=0)
+                feedback = model.generate_feedback(task, current_program)
 
             if mode == "critique+refine":
-                refined = model.refine(task, current_program, feedback, temperature=0)
+                refined = model.refine(task, current_program, feedback)
             elif mode == "direct":
-                refined = model.refine(task, current_program, temperature=0)
+                refined = model.refine(task, current_program)
             else:
-                raise ValueError("Unknown refinement mode")
+                raise ValueError("Unknown mode")
 
             code = extract_code(refined)
             frac_passed, results = test_suite(code)
             fully_passed = frac_passed == 1.0
 
-            print(f"✅ success ({frac_passed*100:.1f}%)"
-                  if fully_passed else f"failed ({frac_passed*100:.1f}%)")
+            print(f"{'✅ success' if fully_passed else '❌ fail'} ({frac_passed*100:.1f}%)")
 
             trajectory["refinement_attempts"].append({
                 "attempt": attempt_count,
@@ -200,15 +186,21 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
             current_program = code
             if fully_passed:
                 seed_success = True
-                overall_success = True
                 print(f"  ✅ Seed {i} succeeded after {attempt_count} attempts")
 
-        if not seed_success:
-            print(f"  ❌ Seed {i} exhausted {max_attempts} attempts without success")
+        return trajectory, seed_success
 
-    # ---------- Stage 3: Return aggregated results ----------
+    # ---------- Stage 2: Run seeds in parallel ----------
+    with ThreadPoolExecutor(max_workers=min(np, 5)) as executor:
+        futures = [executor.submit(process_seed, i, seed) for i, seed in enumerate(seeds, start=1)]
+
+        for fut in as_completed(futures):
+            trajectory, success = fut.result()
+            trajectories.append(trajectory)
+            overall_success = overall_success or success
+
+    # ---------- Stage 3: Aggregate results ----------
     total_programs = sum(1 + len(t["refinement_attempts"]) for t in trajectories)
-
     return {
         "task_id": task,
         "success": overall_success,
@@ -623,8 +615,15 @@ def main():
             write_result(result)
 
     elif args.dataset == "apps":
+        ds = load_dataset("codeparrot/apps", split="test[:5000]")
         # ds = load_dataset("codeparrot/apps", split="test")
-        ds = load_dataset("codeparrot/apps", split="test[:200]")
+
+        # Filter only "introductory" difficulty
+        # ds = ds.filter(lambda ex: ex.get("difficulty", "") == "introductory")
+        ds = ds.filter(lambda ex: ex.get("difficulty", "") == "interview")
+        ds = ds.select(range(min(200, len(ds))))
+
+        print(f"Loaded {len(ds)} easy tasks out of {len(ds)} total.")
         selected = ds if args.task_ids is None else [
             ex for ex in ds if str(ex["problem_id"]) in args.task_ids
         ]
