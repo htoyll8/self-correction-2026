@@ -7,13 +7,20 @@ import argparse
 import traceback
 import tempfile
 import subprocess
-import traceback
+import concurrent.futures
 from tqdm import tqdm
 from datetime import datetime
 from datasets import load_dataset
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from model import Model
+
+
+def safe_call(fn, *args, timeout=90):
+    """Run a blocking function with a timeout to avoid indefinite hangs."""
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        future = ex.submit(fn, *args)
+        return future.result(timeout=timeout)
 
 
 def extract_function_name_from_code(code: str) -> str | None:
@@ -159,14 +166,22 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             feedback = None
             if mode == "critique+refine":
-                feedback = model.generate_feedback(task, current_program)
+                try:
+                    feedback = safe_call(model.generate_feedback, task, current_program, 0, timeout=90)
+                except Exception as e:
+                    print(f"  ⚠️ Feedback generation timeout/error: {e}")
+                    feedback = None
 
-            if mode == "critique+refine":
-                refined = model.refine(task, current_program, feedback)
-            elif mode == "direct":
-                refined = model.refine(task, current_program)
-            else:
-                raise ValueError("Unknown mode")
+            try:
+                if mode == "critique+refine":
+                    refined = safe_call(model.refine, task, current_program, feedback, 0, timeout=120)
+                elif mode == "direct":
+                    refined = safe_call(model.refine, task, current_program, 0, timeout=120)
+                else:
+                    raise ValueError("Unknown refinement mode")
+            except Exception as e:
+                print(f"  ⚠️ Refinement timeout/error: {e}")
+                continue
 
             code = extract_code(refined)
             frac_passed, results = test_suite(code)
@@ -498,12 +513,29 @@ def main():
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tasks", type=int, default=None, help="Limit tasks for debugging")
-    parser.add_argument("--language", choices=["python", "cpp", "java", "go", "js"], default="python",
-                        help="Language subset for HumanEval-X (ignored for MBPP and standard HumanEval).")
-    parser.add_argument("--task_ids", nargs="+", default=None,
-                        help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35")
-    parser.add_argument("--mode", choices=["standard", "iterative"], default="standard",
-                        help="Choose repair strategy: 'standard' (nf/nr loops) or 'iterative' (rolling self-correction)")
+    parser.add_argument(
+        "--language",
+        choices=["python", "cpp", "java", "go", "js"],
+        default="python",
+        help="Language subset for HumanEval-X (ignored for MBPP and standard HumanEval)."
+    )
+    parser.add_argument(
+        "--task_ids",
+        nargs="+",
+        default=None,
+        help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35"
+    )
+    parser.add_argument(
+        "--mode", choices=["standard", "iterative"], 
+        default="standard",
+        help="Choose repair strategy: 'standard' (nf/nr loops) or 'iterative' (rolling self-correction)"
+    )
+    parser.add_argument(
+        "--difficulty",
+        choices=["introductory", "interview", "competition", "all"],
+        default="interview",
+        help="Filter APPS dataset by difficulty level"
+    )
     args = parser.parse_args()
 
     model = Model(model_name=args.model_name, temperature=args.temperature)
@@ -616,11 +648,10 @@ def main():
 
     elif args.dataset == "apps":
         ds = load_dataset("codeparrot/apps", split="test[:5000]")
-        # ds = load_dataset("codeparrot/apps", split="test")
 
-        # Filter only "introductory" difficulty
-        # ds = ds.filter(lambda ex: ex.get("difficulty", "") == "introductory")
-        ds = ds.filter(lambda ex: ex.get("difficulty", "") == "interview")
+        if args.difficulty != "all":
+            ds = ds.filter(lambda ex: ex.get("difficulty", "") == args.difficulty)
+
         ds = ds.select(range(min(200, len(ds))))
 
         print(f"Loaded {len(ds)} easy tasks out of {len(ds)} total.")
