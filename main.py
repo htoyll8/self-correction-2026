@@ -131,18 +131,35 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
     Perform iterative self-repair with multiple independent seeds (np),
     refined in parallel using threads.
     """
+    start_time = time.time()
+    print(f"\n[DEBUG {time.strftime('%H:%M:%S')}] Starting run_self_repair_iterative "
+          f"with {np} seeds, mode={mode}, max_attempts={max_attempts}", flush=True)
+
     trajectories = []
     overall_success = False
 
     # ---------- Stage 1: Generate seeds ----------
-    seeds = model.generate(task_description=task, n=np, temperature=0.7)
+    print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generating {np} initial seeds...", flush=True)
+    try:
+        seeds = model.generate(task_description=task, n=np, temperature=0.7)
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generated {len(seeds)} seeds successfully.", flush=True)
+    except Exception as e:
+        print(f"[ERROR {time.strftime('%H:%M:%S')}] Seed generation failed: {e}", flush=True)
+        return {"task_id": task, "success": False, "trajectories": [], "k": 0}
 
     def process_seed(i, seed):
         """Process one seed end-to-end."""
+        seed_start = time.time()
+        print(f"\n[DEBUG {time.strftime('%H:%M:%S')}] Processing Seed {i}...", flush=True)
         seed_code = extract_code(seed)
-        frac_passed, results = test_suite(seed_code)
-        fully_passed = frac_passed == 1.0
 
+        try:
+            frac_passed, results = test_suite(seed_code)
+        except Exception as e:
+            print(f"[ERROR {time.strftime('%H:%M:%S')}] Test suite crashed for seed {i}: {e}", flush=True)
+            return None, False
+
+        fully_passed = frac_passed == 1.0
         trajectory = {
             "seed_index": i,
             "initial_program": seed_code,
@@ -153,39 +170,51 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
         }
 
         if fully_passed:
-            print(f"Seed {i} ✅ passed all tests initially ({frac_passed*100:.1f}%)")
+            print(f"[INFO {time.strftime('%H:%M:%S')}] Seed {i} ✅ passed all tests initially ({frac_passed*100:.1f}%)", flush=True)
             return trajectory, True
 
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] Seed {i} failed initially ({frac_passed*100:.1f}%), starting refinement loop...", flush=True)
         current_program = seed_code
         attempt_count = 0
         seed_success = False
 
         while attempt_count < max_attempts and not seed_success:
             attempt_count += 1
-            print(f"  Seed {i}, Attempt {attempt_count} → ", end="")
-
+            print(f"[DEBUG {time.strftime('%H:%M:%S')}]   Seed {i}, Attempt {attempt_count} starting...", flush=True)
             feedback = None
+
             if mode == "critique+refine":
                 try:
+                    print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Generating feedback...", flush=True)
                     feedback = safe_call(model.generate_feedback, task, current_program, 0, timeout=90)
+                    print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Feedback received ({len(feedback) if feedback else 0} chars)", flush=True)
                 except Exception as e:
-                    print(f"  ⚠️ Feedback generation timeout/error: {e}")
+                    print(f"[WARN  {time.strftime('%H:%M:%S')}]   Feedback generation timeout/error: {e}", flush=True)
                     feedback = None
 
             try:
+                print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Refining program...", flush=True)
                 if mode == "critique+refine":
                     refined = safe_call(model.refine, task, current_program, feedback, 0, timeout=120)
                 elif mode == "direct":
                     refined = safe_call(model.refine, task, current_program, 0, timeout=120)
                 else:
                     raise ValueError("Unknown refinement mode")
+                print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Refinement done.", flush=True)
             except Exception as e:
-                print(f"  ⚠️ Refinement timeout/error: {e}")
+                print(f"[WARN  {time.strftime('%H:%M:%S')}]   Refinement timeout/error: {e}", flush=True)
                 continue
 
             code = extract_code(refined)
-            frac_passed, results = test_suite(code)
-            fully_passed = frac_passed == 1.0
+
+            try:
+                print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Running test suite on refined code...", flush=True)
+                frac_passed, results = test_suite(code)
+                fully_passed = frac_passed == 1.0
+                print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Test suite finished (pass={frac_passed*100:.1f}%)", flush=True)
+            except Exception as e:
+                print(f"[ERROR {time.strftime('%H:%M:%S')}]   Test suite crash: {e}", flush=True)
+                continue
 
             print(f"{'✅ success' if fully_passed else '❌ fail'} ({frac_passed*100:.1f}%)")
 
@@ -201,21 +230,34 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
             current_program = code
             if fully_passed:
                 seed_success = True
-                print(f"  ✅ Seed {i} succeeded after {attempt_count} attempts")
+                print(f"[SUCCESS {time.strftime('%H:%M:%S')}] ✅ Seed {i} succeeded after {attempt_count} attempts "
+                      f"({time.time()-seed_start:.1f}s elapsed)", flush=True)
+
+        if not seed_success:
+            print(f"[FAIL {time.strftime('%H:%M:%S')}] ❌ Seed {i} exhausted {max_attempts} attempts "
+                  f"({time.time()-seed_start:.1f}s elapsed)", flush=True)
 
         return trajectory, seed_success
 
     # ---------- Stage 2: Run seeds in parallel ----------
+    print(f"[DEBUG {time.strftime('%H:%M:%S')}] Launching thread pool with {min(np,5)} workers...", flush=True)
     with ThreadPoolExecutor(max_workers=min(np, 5)) as executor:
         futures = [executor.submit(process_seed, i, seed) for i, seed in enumerate(seeds, start=1)]
 
         for fut in as_completed(futures):
-            trajectory, success = fut.result()
-            trajectories.append(trajectory)
-            overall_success = overall_success or success
+            try:
+                trajectory, success = fut.result()
+                if trajectory:
+                    trajectories.append(trajectory)
+                    overall_success = overall_success or success
+            except Exception as e:
+                print(f"[ERROR {time.strftime('%H:%M:%S')}] Exception in seed thread: {e}", flush=True)
 
     # ---------- Stage 3: Aggregate results ----------
     total_programs = sum(1 + len(t["refinement_attempts"]) for t in trajectories)
+    print(f"[SUMMARY {time.strftime('%H:%M:%S')}] Finished task after {time.time()-start_time:.1f}s | "
+          f"{len(trajectories)} trajectories, total programs: {total_programs}, success={overall_success}", flush=True)
+
     return {
         "task_id": task,
         "success": overall_success,
@@ -647,26 +689,36 @@ def main():
             write_result(result)
 
     elif args.dataset == "apps":
+        print("[INFO] Loading APPS dataset split: test[:5000]...", flush=True)
         ds = load_dataset("codeparrot/apps", split="test[:5000]")
+        print(f"[INFO] Loaded raw dataset with {len(ds)} entries.", flush=True)
 
         if args.difficulty != "all":
+            print(f"[INFO] Filtering for difficulty = '{args.difficulty}'...", flush=True)
             ds = ds.filter(lambda ex: ex.get("difficulty", "") == args.difficulty)
+        else:
+            print("[INFO] Using all difficulty levels.", flush=True)
 
+        print("[INFO] Selecting up to 200 samples...", flush=True)
         ds = ds.select(range(min(200, len(ds))))
+        print(f"[INFO] After selection: {len(ds)} total examples.", flush=True)
 
-        print(f"Loaded {len(ds)} easy tasks out of {len(ds)} total.")
         selected = ds if args.task_ids is None else [
             ex for ex in ds if str(ex["problem_id"]) in args.task_ids
         ]
-        print(f"Loaded APPS with {len(selected)} test problems.")
+        print(f"[INFO] Final number of tasks to run: {len(selected)}", flush=True)
 
         for i, ex in enumerate(tqdm(selected, desc="Running APPS tasks")):
             if args.max_tasks and i >= args.max_tasks:
+                print(f"[INFO] Reached max_tasks limit ({args.max_tasks}), stopping early.", flush=True)
                 break
 
             problem_id = ex["problem_id"]
             prompt = ex["question"]
             difficulty = ex.get("difficulty", "unknown")
+
+            print(f"\n[INFO] --- Task {i+1}/{len(selected)} ---", flush=True)
+            print(f"[INFO] Problem ID: {problem_id}, Difficulty: {difficulty}", flush=True)
 
             # Parse solutions and I/O pairs safely
             try:
@@ -677,8 +729,15 @@ def main():
             try:
                 io_pairs = json.loads(ex.get("input_output", "{}"))
                 inputs, outputs = io_pairs.get("inputs", []), io_pairs.get("outputs", [])
-            except Exception:
+                print(f"[DEBUG] Parsed {len(inputs)} input/output pairs.", flush=True)
+            except Exception as e:
+                print(f"[WARN] Could not parse I/O for {problem_id}: {e}", flush=True)
                 inputs, outputs = [], []
+
+            # Limit excessive test cases for speed
+            if len(inputs) > 30:
+                print(f"[WARN] Truncating {len(inputs)} → 30 test pairs for problem {problem_id}")
+                inputs, outputs = inputs[:30], outputs[:30]
 
             # Skip invalid or empty examples
             if not inputs or not outputs:
@@ -686,36 +745,44 @@ def main():
                 continue
 
             # Create APPS-style test suite (runs programs with stdin/stdout)
+            print("[INFO] Creating APPS test suite with timeout=10s...", flush=True)
             test_suite = make_apps_test_suite(inputs, outputs, timeout_seconds=10)
 
             # Run repair depending on mode
-            if args.mode == "iterative":
-                result = run_self_repair_iterative(
-                    task=prompt,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    max_attempts=args.max_attempts,
-                    mode="critique+refine",
-                )
-            else:
-                result = run_self_repair(
-                    task=prompt,
-                    model=model,
-                    test_suite=test_suite,
-                    np=args.np,
-                    nf=args.nf,
-                    nr=args.nr,
-                )
+            print(f"[INFO] Starting {'iterative' if args.mode == 'iterative' else 'standard'} repair...", flush=True)
+            try:
+                if args.mode == "iterative":
+                    result = run_self_repair_iterative(
+                        task=prompt,
+                        model=model,
+                        test_suite=test_suite,
+                        np=args.np,
+                        max_attempts=args.max_attempts,
+                        mode="critique+refine",
+                    )
+                else:
+                    result = run_self_repair(
+                        task=prompt,
+                        model=model,
+                        test_suite=test_suite,
+                        np=args.np,
+                        nf=args.nf,
+                        nr=args.nr,
+                    )
+                print(f"[INFO] Completed repair for problem {problem_id}.", flush=True)
+            except Exception as e:
+                print(f"[ERROR] Exception during repair of {problem_id}: {e}", flush=True)
+                continue
 
             result.update({
                 "dataset": "apps",
                 "problem_id": problem_id,
                 "difficulty": difficulty,
             })
+            print(f"[INFO] Writing results for {problem_id}...", flush=True)
             write_result(result)
 
-        f.close()
+    f.close()
     print(f"\n✅ Completed {args.dataset}. Results streamed to {out_path}")
 
 
