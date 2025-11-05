@@ -33,6 +33,24 @@ def extract_function_name_from_code(code: str) -> str | None:
     return match.group(1) if match else None
 
 
+def build_feedback_history(trajectory):
+    """
+    Construct a full history string of all previous refinement attempts
+    for use in history-aware feedback generation.
+    """
+    if not trajectory.get("refinement_attempts"):
+        return ""
+
+    history_lines = []
+    for r in trajectory["refinement_attempts"]:
+        history_lines.append(
+            f"Attempt {r['attempt']}: pass={r['pass_fraction']*100:.1f}% | passed={r['passed']}\n"
+            f"Feedback excerpt:\n{r['feedback'][:300] if r['feedback'] else 'None'}\n"
+            f"Code excerpt:\n{r['program'][:400]}...\n"
+        )
+    return "\n".join(history_lines)
+
+
 def run_self_repair(task, model, test_suite, np=5,
                     nf=1, nr=1, mode="critique+refine"):
     """
@@ -183,11 +201,26 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
             print(f"[DEBUG {time.strftime('%H:%M:%S')}]   Seed {i}, Attempt {attempt_count} starting...", flush=True)
             feedback = None
 
-            if mode == "critique+refine":
+            if mode in ("critique+refine", "critique+history+refine"):
                 try:
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Generating feedback...", flush=True)
-                    feedback = safe_call(model.generate_feedback, task, current_program, 0, timeout=90)
+
+                    if mode == "critique+refine":
+                        # Standard: feedback only based on current program
+                        feedback_input = current_program
+
+                    elif mode == "critique+history+refine":
+                        history_context = build_feedback_history(trajectory)
+                        feedback_input = (
+                            f"Task description:\n{task}\n\n"
+                            f"Summary of previous attempts:\n{history_context}\n\n"
+                            f"Current program to critique:\n{current_program}"
+                        )
+                        print(f"History context: {history_context}")
+
+                    feedback = safe_call(model.generate_feedback, task, feedback_input, 0, timeout=90)
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Feedback received ({len(feedback) if feedback else 0} chars)", flush=True)
+
                 except Exception as e:
                     print(f"[WARN  {time.strftime('%H:%M:%S')}]   Feedback generation timeout/error: {e}", flush=True)
                     feedback = None
@@ -568,7 +601,7 @@ def main():
         help="Specific task IDs to run, e.g. HumanEval/16 HumanEval/35"
     )
     parser.add_argument(
-        "--mode", choices=["standard", "iterative"], 
+        "--mode", choices=["standard", "iterative"],
         default="standard",
         help="Choose repair strategy: 'standard' (nf/nr loops) or 'iterative' (rolling self-correction)"
     )
@@ -578,6 +611,17 @@ def main():
         default="interview",
         help="Filter APPS dataset by difficulty level"
     )
+    parser.add_argument(
+        "--refine_mode",
+        choices=["direct", "critique+refine", "critique+history+refine"],
+        default="critique+refine",
+        help=(
+            "Refinement strategy to use in iterative mode: "
+            "'direct' (no feedback), 'critique+refine' (feedback on current code), "
+            "or 'critique+history+refine' (feedback using full past trajectory)."
+        )
+    )
+
     args = parser.parse_args()
 
     model = Model(model_name=args.model_name, temperature=args.temperature)
@@ -621,7 +665,7 @@ def main():
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
                     task=desc, model=model, test_suite=test_suite,
-                    np=args.np, max_attempts=args.max_attempts, mode="critique+refine"
+                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode
                 )
             else:
                 result = run_self_repair(
@@ -647,7 +691,7 @@ def main():
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
                     task=prompt, model=model, test_suite=test_suite,
-                    np=args.np, max_attempts=args.max_attempts, mode="critique+refine"
+                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode
                 )
             else:
                 result = run_self_repair(
@@ -676,7 +720,7 @@ def main():
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
                     task=prompt, model=model, test_suite=test_suite,
-                    np=args.np, max_attempts=args.max_attempts, mode="critique+refine"
+                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode
                 )
             else:
                 result = run_self_repair(
@@ -758,7 +802,7 @@ def main():
                         test_suite=test_suite,
                         np=args.np,
                         max_attempts=args.max_attempts,
-                        mode="critique+refine",
+                        mode=args.refine_mode
                     )
                 else:
                     result = run_self_repair(
