@@ -216,7 +216,7 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                             f"Summary of previous attempts:\n{history_context}\n\n"
                             f"Current program to critique:\n{current_program}"
                         )
-                        print(f"History context: {history_context}")
+                        print(f"History context: {history_context}", flush=True)
 
                     feedback = safe_call(model.generate_feedback, task, feedback_input, 0, timeout=90)
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Feedback received ({len(feedback) if feedback else 0} chars)", flush=True)
@@ -227,12 +227,12 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             try:
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Refining program...", flush=True)
-                if mode == "critique+refine":
+                if mode in ("critique+refine", "critique+history+refine"):
                     refined = safe_call(model.refine, task, current_program, feedback, 0, timeout=120)
                 elif mode == "direct":
                     refined = safe_call(model.refine, task, current_program, 0, timeout=120)
                 else:
-                    raise ValueError("Unknown refinement mode")
+                    raise ValueError(f"Unknown refinement mode: {mode}")
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Refinement done.", flush=True)
             except Exception as e:
                 print(f"[WARN  {time.strftime('%H:%M:%S')}]   Refinement timeout/error: {e}", flush=True)

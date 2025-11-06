@@ -38,22 +38,25 @@ class Model:
 
         return responses
 
-    def generate_feedback(self,
-                          task_description,
-                          program,
-                          temperature=None):
+    def generate_feedback(self, task_description, program_or_context, temperature=None):
         """
-        Ask the model to critique a program that failed its test cases.
-        Removes temperature if model is GPT-5 (which does not support it).
+        Ask the model to critique a failed attempt (program only or with history context).
+        Automatically adjusts the prompt if history context is included.
         """
-        # Resolve temperature value (default to model's own setting)
+        # Resolve temperature
         temperature = temperature if temperature is not None else getattr(self, "temperature", None)
 
-        # Build feedback prompt
+        # Detect whether this input includes history context
+        has_history = "Summary of previous attempts:" in program_or_context
+
+        # Dynamically adjust the label
+        section_label = "Context (previous attempts and current program)" if has_history else "Program"
+
+        # Build prompt
         prompt = (
-            f"The following program did not pass its tests.\n\n"
+            f"The following attempt did not pass all of its tests.\n\n"
             f"Task:\n{task_description}\n\n"
-            f"Program:\n{program}\n\n"
+            f"{section_label}:\n{program_or_context}\n\n"
             f"Please explain what might be wrong and how to fix it."
         )
 
