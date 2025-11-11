@@ -3,6 +3,7 @@ import os
 import json
 import time
 import signal
+import inspect
 import argparse
 import traceback
 import tempfile
@@ -37,18 +38,36 @@ def build_feedback_history(trajectory):
     """
     Construct a full history string of all previous refinement attempts
     for use in history-aware feedback generation.
+    Includes the full code for each past attempt (no feedback text).
     """
     if not trajectory.get("refinement_attempts"):
         return ""
 
     history_lines = []
     for r in trajectory["refinement_attempts"]:
+        program_text = r["program"] if r["program"] else "None"
         history_lines.append(
+            f"───────────────────────────────\n"
             f"Attempt {r['attempt']}: pass={r['pass_fraction']*100:.1f}% | passed={r['passed']}\n"
-            f"Feedback excerpt:\n{r['feedback'][:300] if r['feedback'] else 'None'}\n"
-            f"Code excerpt:\n{r['program'][:400]}...\n"
+            f"Program:\n{program_text}\n"
         )
+
     return "\n".join(history_lines)
+
+
+def build_antiunified_history(model, trajectory):
+    """
+    Builds a full concatenated history of previous program attempts,
+    then asks the model to perform anti-unification over them.
+    """
+    if not trajectory.get("refinement_attempts"):
+        return ""
+
+    # Step 2: call the LLM to perform anti-unification
+    anti_unified = model.generate_antiunified_history(trajectory)
+
+    # Step 3: return both raw and abstracted forms
+    return anti_unified
 
 
 def run_self_repair(task, model, test_suite, np=5,
@@ -201,7 +220,7 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
             print(f"[DEBUG {time.strftime('%H:%M:%S')}]   Seed {i}, Attempt {attempt_count} starting...", flush=True)
             feedback = None
 
-            if mode in ("critique+refine", "critique+history+refine"):
+            if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine"):
                 try:
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Generating feedback...", flush=True)
 
@@ -216,8 +235,26 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                             f"Summary of previous attempts:\n{history_context}\n\n"
                             f"Current program to critique:\n{current_program}"
                         )
-                        print(f"History context: {history_context}", flush=True)
 
+                    elif mode == "critique+antiunify+refine":
+                        # Build anti-unified abstraction of all prior programs
+                        attempts = trajectory.get("refinement_attempts", [])
+                        print(f"[TRACE] {len(attempts)} previous attempts in trajectory.", flush=True)
+
+                        if len(attempts) < 1:
+                            print("[TRACE] Not enough attempts to perform anti-unification yet.", flush=True)
+                            anti_unified_context = ""
+                        else:
+                            anti_unified_context = build_antiunified_history(model, trajectory)
+                            print(f"[TRACE] Anti-unified abstraction (first 200 chars): {anti_unified_context[:200]!r}", flush=True)
+
+                        feedback_input = (
+                            f"Task description:\n{task}\n\n"
+                            f"Anti-unified abstraction of previous attempts:\n{anti_unified_context}\n\n"
+                            f"Current program to critique:\n{current_program}"
+                        )
+
+                    print(f"Feedback input: {feedback_input}", flush=True)
                     feedback = safe_call(model.generate_feedback, task, feedback_input, 0, timeout=90)
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Feedback received ({len(feedback) if feedback else 0} chars)", flush=True)
 
@@ -227,7 +264,7 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             try:
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Refining program...", flush=True)
-                if mode in ("critique+refine", "critique+history+refine"):
+                if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine"):
                     refined = safe_call(model.refine, task, current_program, feedback, 0, timeout=120)
                 elif mode == "direct":
                     refined = safe_call(model.refine, task, current_program, 0, timeout=120)
@@ -259,6 +296,8 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                 "test_results": results,
                 "passed": fully_passed
             })
+            print(f"[TRACE] Logged attempt {attempt_count} (pass={frac_passed*100:.1f}%, passed={fully_passed})", flush=True)
+            print(f"[TRACE] → Total attempts logged so far: {len(trajectory['refinement_attempts'])}", flush=True)
 
             current_program = code
             if fully_passed:
@@ -474,8 +513,8 @@ int total_tests = 0;
 } while(0)
 """
             footer = r"""
-std::cout << "PASS FRACTION: " 
-          << (100.0 * passed_tests / total_tests) 
+std::cout << "PASS FRACTION: "
+          << (100.0 * passed_tests / total_tests)
           << "%" << std::endl;
 return 0;
 }
@@ -613,7 +652,12 @@ def main():
     )
     parser.add_argument(
         "--refine_mode",
-        choices=["direct", "critique+refine", "critique+history+refine"],
+        choices=[
+            "direct",
+            "critique+refine",
+            "critique+history+refine",
+            "critique+antiunify+refine"
+        ],
         default="critique+refine",
         help=(
             "Refinement strategy to use in iterative mode: "
