@@ -1,18 +1,25 @@
 import re
 import os
+import sys
 import json
 import time
 import signal
+import textwrap
 import inspect
 import argparse
 import traceback
+import coverage
 import tempfile
 import subprocess
-import concurrent.futures
 from tqdm import tqdm
+import concurrent.futures
 from datetime import datetime
 from datasets import load_dataset
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from threading import Lock
+coverage_lock = Lock()
 
 from model import Model
 
@@ -230,9 +237,16 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
                     elif mode == "critique+history+refine":
                         history_context = build_feedback_history(trajectory)
+
+                        history_block = (
+                            f"Summary of previous attempts:\n{history_context}\n\n"
+                            if history_context
+                            else ""
+                        )
+
                         feedback_input = (
                             f"Task description:\n{task}\n\n"
-                            f"Summary of previous attempts:\n{history_context}\n\n"
+                            f"{history_block}"
                             f"Current program to critique:\n{current_program}"
                         )
 
@@ -442,43 +456,55 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python", t
     # PYTHON
     # -----------------------------
     def run_python(program_code: str):
+        print("\n=== DEBUG: Starting run_python ===")
+        print("Program code received:\n", program_code)
+
         env = {}
         try:
+            print("DEBUG: Executing program_code...")
             exec(program_code, env)
+            print("DEBUG: exec() complete. env keys:", list(env.keys()))
+
             if entry_point not in env:
                 return 0.0, [("[Error]", f"Function '{entry_point}' not defined")]
+
+            print(f"DEBUG: Entry point '{entry_point}' FOUND.")
             candidate = env[entry_point]
 
             assert_lines = [
                 line.strip() for line in tests.splitlines()
                 if line.strip().startswith("assert ")
             ]
+            print(f"DEBUG: Extracted {len(assert_lines)} assert lines:")
+            for line in assert_lines:
+                print("   ASSERT:", line)
+
             total, passed, results = len(assert_lines), 0, []
 
-            signal.signal(signal.SIGALRM, timeout_handler)
-
             for i, assert_line in enumerate(assert_lines, 1):
+                print(f"\nDEBUG: Running assertion #{i}: {assert_line}")
                 try:
-                    signal.alarm(timeout_seconds)
                     exec(assert_line, {**env, "candidate": candidate})
-                    signal.alarm(0)
                     passed += 1
+                    print("DEBUG: Assertion PASSED")
                     results.append((i, "✅ PASS", assert_line))
                 except TimeoutException:
+                    print("DEBUG: TIMEOUT")
                     results.append((i, f"TIMEOUT (> {timeout_seconds}s)", assert_line))
-                    signal.alarm(0)
                 except AssertionError:
+                    print("DEBUG: ASSERTION FAILED:", e)
                     results.append((i, "❌ FAIL", assert_line))
-                    signal.alarm(0)
                 except Exception as e:
+                    print("DEBUG: ERROR during assertion:", type(e).__name__, str(e))
                     tb = traceback.format_exception_only(type(e), e)[0].strip()
                     results.append((i, f"⚠️ ERROR: {tb}", assert_line))
-                    signal.alarm(0)
 
-            signal.alarm(0)
-            return (passed / total if total else 0.0), results
+            score = passed / total if total else 0.0
+            print(f"\nDEBUG: Final score = {score} ({passed}/{total})")
+            return score, results
 
         except Exception as e:
+            print("DEBUG: FATAL ERROR during program execution:", e)
             return 0.0, [("[Fatal]", str(e))]
 
     # -----------------------------
@@ -823,9 +849,9 @@ def main():
                 inputs, outputs = [], []
 
             # Limit excessive test cases for speed
-            if len(inputs) > 30:
-                print(f"[WARN] Truncating {len(inputs)} → 30 test pairs for problem {problem_id}")
-                inputs, outputs = inputs[:30], outputs[:30]
+            # if len(inputs) > 30:
+            #     print(f"[WARN] Truncating {len(inputs)} → 30 test pairs for problem {problem_id}")
+            #     inputs, outputs = inputs[:30], outputs[:30]
 
             # Skip invalid or empty examples
             if not inputs or not outputs:
