@@ -46,13 +46,18 @@ def build_feedback_history(trajectory):
     Construct a full history string of all previous refinement attempts
     for use in history-aware feedback generation.
     Includes the full code for each past attempt (no feedback text).
+
+    Returns None if fewer than 2 refinement attempts.
     """
-    if not trajectory.get("refinement_attempts"):
-        return ""
+    attempts = trajectory.get("refinement_attempts", [])
+
+    # Only include history if there are at least 2 attempts
+    if len(attempts) < 2:
+        return None
 
     history_lines = []
-    for r in trajectory["refinement_attempts"]:
-        program_text = r["program"] if r["program"] else "None"
+    for r in attempts:
+        program_text = r.get("program") or "None"
         history_lines.append(
             f"───────────────────────────────\n"
             f"Attempt {r['attempt']}: pass={r['pass_fraction']*100:.1f}% | passed={r['passed']}\n"
@@ -456,6 +461,32 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python", t
     # PYTHON
     # -----------------------------
     def run_python(program_code: str):
+        def extract_asserts(tests: str):
+            lines = [l.rstrip() for l in tests.splitlines()]
+            asserts = []
+            i = 0
+            while i < len(lines):
+                line = lines[i].lstrip()
+
+                if line.startswith("assert "):
+                    stmt = line
+                    open_brackets = stmt.count("[") - stmt.count("]")
+
+                    # continue consuming lines until brackets are balanced
+                    while open_brackets > 0:
+                        i += 1
+                        if i >= len(lines):
+                            break
+                        next_line = lines[i].rstrip()
+                        stmt += " " + next_line
+                        open_brackets += next_line.count("[") - next_line.count("]")
+
+                    asserts.append(stmt)
+
+                i += 1
+
+            return asserts
+
         print("\n=== DEBUG: Starting run_python ===")
         print("Program code received:\n", program_code)
 
@@ -471,10 +502,7 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python", t
             print(f"DEBUG: Entry point '{entry_point}' FOUND.")
             candidate = env[entry_point]
 
-            assert_lines = [
-                line.strip() for line in tests.splitlines()
-                if line.strip().startswith("assert ")
-            ]
+            assert_lines = extract_asserts(tests)
             print(f"DEBUG: Extracted {len(assert_lines)} assert lines:")
             for line in assert_lines:
                 print("   ASSERT:", line)
