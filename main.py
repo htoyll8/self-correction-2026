@@ -12,16 +12,20 @@ import coverage
 import tempfile
 import subprocess
 from tqdm import tqdm
+from io import StringIO
 import concurrent.futures
 from datetime import datetime
 from datasets import load_dataset
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import subprocess, json, tempfile, sys
+from pathlib import Path
 from threading import Lock
 coverage_lock = Lock()
 
 from model import Model
+
+TRACE_RUNNER = str(Path(__file__).resolve().parent / "trace_runner.py")
 
 
 def safe_call(fn, *args, timeout=90):
@@ -55,8 +59,11 @@ def build_feedback_history(trajectory):
     if len(attempts) < 2:
         return None
 
+    # Exclude the last attempt (the current program)
+    past_attempts = attempts[:-1]
+
     history_lines = []
-    for r in attempts:
+    for r in past_attempts:
         program_text = r.get("program") or "None"
         history_lines.append(
             f"───────────────────────────────\n"
@@ -68,18 +75,164 @@ def build_feedback_history(trajectory):
 
 
 def build_antiunified_history(model, trajectory):
-    """
-    Builds a full concatenated history of previous program attempts,
-    then asks the model to perform anti-unification over them.
-    """
-    if not trajectory.get("refinement_attempts"):
-        return ""
+    print("\n[DEBUG] Entered build_antiunified_history()", flush=True)
 
-    # Step 2: call the LLM to perform anti-unification
+    attempts = trajectory.get("refinement_attempts", [])
+    print(f"[DEBUG] refinement_attempts count: {len(attempts)}", flush=True)
+
+    if not attempts:
+        print("[DEBUG] No attempts found. Returning empty structure.", flush=True)
+        return {
+            "anti_unified": "",
+            "failing_sets": {},
+            "overlap": set(),
+            "unique": {}
+        }
+
+    # ------------------------------------------------------
+    print("[DEBUG] Calling model.generate_antiunified_history()", flush=True)
     anti_unified = model.generate_antiunified_history(trajectory)
+    print("[DEBUG] Anti-unified returned (first 200 chars):", anti_unified[:200], flush=True)
+    # ------------------------------------------------------
 
-    # Step 3: return both raw and abstracted forms
-    return anti_unified
+    # These MUST match your caller:
+    failing_sets = {}   # attempt_idx -> set of test_ids
+    overlap = set()
+    unique = {}
+
+    # Helper: parse FAIL messages
+    def parse_failure_msg(msg):
+        import re
+        m = re.findall(r"Expected:\s*([^,]+)[,]?\s*Got:\s*(.*)", msg)
+        if m:
+            expected, got = m[0]
+            return expected.strip(), got.strip()
+        return None, None
+
+    # ------------------------------------------------------
+    # Process INITIAL attempt
+    # ------------------------------------------------------
+    print("[DEBUG] Processing initial test results", flush=True)
+
+    initial = trajectory.get("initial_test_results", [])
+    print(f"[DEBUG] initial_test_results length: {len(initial)}", flush=True)
+
+    initial_fail_ids = set()
+
+    for idx, (tid, status, detail) in enumerate(initial):
+        print(f"[DEBUG] Initial test row idx={idx}, id={tid}, status={status}", flush=True)
+
+        if "FAIL" in status:
+            print(f"       ↳ FAIL detected (initial). detail={detail}", flush=True)
+            initial_fail_ids.add(tid)
+
+    failing_sets[0] = initial_fail_ids
+    print(f"[DEBUG] failing_sets[0] = {initial_fail_ids}", flush=True)
+
+    # ------------------------------------------------------
+    # Process refinement attempts
+    # ------------------------------------------------------
+    print("[DEBUG] Processing refinement attempts", flush=True)
+
+    for j, attempt in enumerate(attempts, start=1):
+        results = attempt.get("test_results", [])
+        print(f"[DEBUG] Attempt {j}: {len(results)} test results", flush=True)
+
+        fail_ids = set()
+
+        for row_idx, (tid, status, detail) in enumerate(results):
+            print(f"  [DEBUG] Row {row_idx}: id={tid}, status={status}", flush=True)
+
+            if "FAIL" in status:
+                print("       ↳ FAIL detected", flush=True)
+                fail_ids.add(tid)
+
+        failing_sets[j] = fail_ids
+        print(f"[DEBUG] failing_sets[{j}] = {fail_ids}", flush=True)
+
+    # ------------------------------------------------------
+    # Compute overlap
+    # ------------------------------------------------------
+    print("[DEBUG] Computing overlaps and unique failures", flush=True)
+
+    non_empty_sets = [s for s in failing_sets.values() if s]
+    print(f"[DEBUG] non_empty_sets = {non_empty_sets}", flush=True)
+
+    if non_empty_sets:
+        overlap = set.intersection(*non_empty_sets)
+    else:
+        overlap = set()
+
+    print(f"[DEBUG] overlap = {overlap}", flush=True)
+
+    # Unique failing tests per attempt
+    unique = {
+        k: v - overlap
+        for k, v in failing_sets.items()
+    }
+
+    print(f"[DEBUG] unique = {unique}", flush=True)
+
+    # ------------------------------------------------------
+    # Final return
+    # ------------------------------------------------------
+    print("[DEBUG] Finished build_antiunified_history()", flush=True)
+    print("[DEBUG] Returning structure keys:", list({
+        "anti_unified": anti_unified,
+        "failing_sets": failing_sets,
+        "overlap": overlap,
+        "unique": unique
+    }.keys()), flush=True)
+
+    return {
+        "anti_unified": anti_unified,
+        "failing_sets": failing_sets,   # <-- correct key
+        "overlap": overlap,             # <-- correct key
+        "unique": unique                # <-- correct key
+    }
+
+
+def run_in_subprocess(code_str, input_str, timeout=3):
+    """Runs code_str on input_str inside a fully isolated Python subprocess."""
+    payload = json.dumps({
+        "code": code_str,
+        "input": input_str
+    })
+
+    proc = subprocess.Popen(
+        [sys.executable, TRACE_RUNNER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    try:
+        out, err = proc.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {
+            "output": None,
+            "coverage": [],
+            "error": "TIMEOUT"
+        }
+
+    if err:
+        # Any stderr from the runner itself
+        return {
+            "output": None,
+            "coverage": [],
+            "error": "RunnerError:\n" + err
+        }
+
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {
+            "output": None,
+            "coverage": [],
+            "error": f"Bad JSON from runner: {out}"
+        }
 
 
 def run_self_repair(task, model, test_suite, np=5,
@@ -103,8 +256,10 @@ def run_self_repair(task, model, test_suite, np=5,
 
     for i, seed in enumerate(seeds, 1):
         seed_code = extract_code(seed)
-        frac_passed, results = test_suite(seed_code)
+        frac_passed, results, coverage = test_suite(seed_code)
         print(f"Seed {i} → passed {frac_passed*100:.1f}% of tests")
+
+        print(f"Coverage: {coverage}", flush=True)
 
         fully_passed = frac_passed == 1.0
 
@@ -142,7 +297,7 @@ def run_self_repair(task, model, test_suite, np=5,
                     raise ValueError("Unknown refinement mode")
 
                 code = extract_code(refined)
-                frac_passed, results = test_suite(code)
+                frac_passed, results, coverage = test_suite(code)
                 fully_passed = frac_passed == 1.0
                 print(f"✅ success ({frac_passed*100:.1f}%)" if fully_passed else f"failed ({frac_passed*100:.1f}%)")
 
@@ -203,10 +358,12 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
         seed_code = extract_code(seed)
 
         try:
-            frac_passed, results = test_suite(seed_code)
+            frac_passed, results, coverage = test_suite(seed_code)
         except Exception as e:
             print(f"[ERROR {time.strftime('%H:%M:%S')}] Test suite crashed for seed {i}: {e}", flush=True)
             return None, False
+
+        print(f"Coverage: {coverage}")
 
         fully_passed = frac_passed == 1.0
         trajectory = {
@@ -249,10 +406,14 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                             else ""
                         )
 
+                        current_pass = trajectory["refinement_attempts"][-1]["pass_fraction"] * 100
+
                         feedback_input = (
                             f"Task description:\n{task}\n\n"
                             f"{history_block}"
-                            f"Current program to critique:\n{current_program}"
+                            f"Current program to critique "
+                            f"(pass={current_pass:.1f}%):\n"
+                            f"{current_program}"
                         )
 
                     elif mode == "critique+antiunify+refine":
@@ -260,17 +421,63 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                         attempts = trajectory.get("refinement_attempts", [])
                         print(f"[TRACE] {len(attempts)} previous attempts in trajectory.", flush=True)
 
-                        if len(attempts) < 1:
+                        if len(attempts) < 2:
                             print("[TRACE] Not enough attempts to perform anti-unification yet.", flush=True)
                             anti_unified_context = ""
                         else:
-                            anti_unified_context = build_antiunified_history(model, trajectory)
-                            print(f"[TRACE] Anti-unified abstraction (first 200 chars): {anti_unified_context[:200]!r}", flush=True)
+                            au_data = build_antiunified_history(model, trajectory)
+                            anti_text = au_data["anti_unified"]
+                            failing_sets = au_data["failing_sets"]
+                            overlap = au_data["overlap"]
+                            unique = au_data["unique"]
+
+                            print(f"[TRACE] Anti-unified abstraction (first 200 chars): {anti_text[:200]!r}", flush=True)
+
+                            # --------------------------------------------------
+                            # WRITE ANTI-UNIFIED ABSTRACTION TO FILE
+                            # --------------------------------------------------
+                            import os
+                            os.makedirs("antiunify_logs", exist_ok=True)
+
+                            timestamp = time.strftime("%Y%m%d-%H%M%S")
+                            fname = f"antiunify_logs/seed_{i}_attempt_{attempt_count}_{timestamp}.txt"
+
+                            with open(fname, "w", encoding="utf-8") as f:
+                                print(f"OPENED FILE!")
+                                f.write(f"Task:\n{task}\n\n")
+
+                                f.write("=== Anti-Unified Abstraction ===\n")
+                                f.write(anti_text + "\n\n")
+
+                                f.write("=== Failing Test Sets (per attempt) ===\n")
+                                for attempt_idx, fs in failing_sets.items():
+                                    f.write(f"Attempt {attempt_idx}: {sorted(fs)}\n")
+                                f.write("\n")
+
+                                f.write("=== Overlapping Failing Tests (intersection) ===\n")
+                                f.write(f"{sorted(overlap)}\n\n")
+
+                                f.write("=== Unique Failing Tests (per attempt) ===\n")
+                                for attempt_idx, uniq in unique.items():
+                                    f.write(f"Attempt {attempt_idx}: {sorted(uniq)}\n")
+                                f.write("\n")
+
+                            print(f"[TRACE] Anti-unified data written to {fname}", flush=True)
+                            # --------------------------------------------------
+
+                            anti_unified_context = (
+                                "Anti-unified abstraction of previous attempts:\n"
+                                f"{anti_text}\n\n"
+                            )
+
+                        current_pass = trajectory["refinement_attempts"][-1]["pass_fraction"] * 100
 
                         feedback_input = (
                             f"Task description:\n{task}\n\n"
-                            f"Anti-unified abstraction of previous attempts:\n{anti_unified_context}\n\n"
-                            f"Current program to critique:\n{current_program}"
+                            f"{anti_unified_context}"
+                            f"Current program to critique "
+                            f"(pass={current_pass:.1f}%):\n"
+                            f"{current_program}"
                         )
 
                     print(f"Feedback input: {feedback_input}", flush=True)
@@ -298,7 +505,7 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             try:
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Running test suite on refined code...", flush=True)
-                frac_passed, results = test_suite(code)
+                frac_passed, results, coverage = test_suite(code)
                 fully_passed = frac_passed == 1.0
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Test suite finished (pass={frac_passed*100:.1f}%)", flush=True)
             except Exception as e:
@@ -406,41 +613,97 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
     return test_suite
 
 
-def make_apps_test_suite(inputs, outputs, timeout_seconds=10):
-    """
-    Returns a callable test function that runs an APPS-style program.
-    Each input is fed via stdin, and stdout is compared to expected output.
-    """
+# def make_apps_test_suite(inputs, outputs, timeout_seconds=10):
+#     """
+#     Returns a callable test function that runs an APPS-style program.
+#     Each input is fed via stdin, and stdout is compared to expected output.
+#     """
+#     def run(program_code: str):
+#         print("\n=== DEBUG: Starting APPS test suite ===")
+#         print("DEBUG: Received program_code:\n", program_code)
+
+#         results, passed = [], 0
+
+#         with tempfile.TemporaryDirectory() as tmpdir:
+#             src_path = os.path.join(tmpdir, "main.py")
+#             print(f"DEBUG: Writing program to temporary file: {src_path}")
+
+#             with open(src_path, "w") as f:
+#                 f.write(program_code)
+
+#             for j, (inp, out) in enumerate(zip(inputs, outputs), 1):
+#                 # print(f"--- DEBUG: Test #{j} ---")
+#                 # print(f"DEBUG: Input:\n{inp!r}")
+#                 # print(f"DEBUG: Expected Output:\n{out!r}")
+
+#                 try:
+#                     proc = subprocess.run(
+#                         ["python3", src_path],
+#                         input=inp.encode(),
+#                         capture_output=True,
+#                         timeout=timeout_seconds,
+#                     )
+#                     pred = proc.stdout.decode().strip()
+#                     gold = out.strip()
+
+#                     # print(f"DEBUG: Subprocess completed with return code {proc.returncode}")
+#                     # print(f"DEBUG: Raw stdout: {proc.stdout!r}")
+#                     # print(f"DEBUG: Decoded stdout: {pred!r}")
+#                     # print(f"DEBUG: Expected: {gold!r}")
+
+#                     if pred == gold:
+#                         print("DEBUG: Test PASSED")
+#                         passed += 1
+#                         results.append((j, "✅ PASS", inp.strip()))
+#                     else:
+#                         print("DEBUG: Test FAILED")
+#                         results.append((j, "❌ FAIL", f"Expected: {gold!r}, Got: {pred!r}"))
+#                 except subprocess.TimeoutExpired:
+#                     print(f"DEBUG: TIMEOUT (> {timeout_seconds}s)")
+#                     results.append((j, f"TIMEOUT (> {timeout_seconds}s)", inp.strip()))
+#                 except Exception as e:
+#                     print(f"DEBUG: ERROR running subprocess: {e}")
+#                     results.append((j, f"⚠️ ERROR: {e}", inp.strip()))
+
+#         total = len(inputs)
+#         score = passed / total if total else 0.0
+#         print(f"\n=== DEBUG: Final score: {score} ({passed}/{total}) ===")
+
+#         return score, results
+
+#     return run
+
+
+def make_apps_test_suite(inputs, outputs, timeout_seconds=5):
+
     def run(program_code: str):
-        results, passed = [], 0
+        passed = 0
+        results = []
+        coverage_map = {}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src_path = os.path.join(tmpdir, "main.py")
-            with open(src_path, "w") as f:
-                f.write(program_code)
+        for j, (inp, out) in enumerate(zip(inputs, outputs), start=1):
 
-            for j, (inp, out) in enumerate(zip(inputs, outputs), 1):
-                try:
-                    proc = subprocess.run(
-                        ["python3", src_path],
-                        input=inp.encode(),
-                        capture_output=True,
-                        timeout=timeout_seconds,
-                    )
-                    pred = proc.stdout.decode().strip()
-                    gold = out.strip()
-                    if pred == gold:
-                        passed += 1
-                        results.append((j, "✅ PASS", inp.strip()))
-                    else:
-                        results.append((j, "❌ FAIL", f"Expected: {gold!r}, Got: {pred!r}"))
-                except subprocess.TimeoutExpired:
-                    results.append((j, f"TIMEOUT (> {timeout_seconds}s)", inp.strip()))
-                except Exception as e:
-                    results.append((j, f"⚠️ ERROR: {e}", inp.strip()))
+            r = run_in_subprocess(program_code, inp, timeout=timeout_seconds)
 
-        total = len(inputs)
-        return (passed / total if total else 0.0), results
+            model_out = r["output"]
+            cov = set(r["coverage"])
+            err = r["error"]
+
+            coverage_map[j] = cov
+
+            if err is not None:
+                results.append((j, f"ERROR: {err}", inp.strip()))
+                continue
+
+            gold = out.strip()
+            if str(model_out) == gold:
+                passed += 1
+                results.append((j, "PASS", inp.strip()))
+            else:
+                results.append((j, "FAIL", f"Expected {gold!r}, Got {model_out!r}"))
+
+        score = passed / len(inputs)
+        return score, results, coverage_map
 
     return run
 
