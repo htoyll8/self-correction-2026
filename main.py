@@ -637,67 +637,6 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
     return test_suite
 
 
-# def make_apps_test_suite(inputs, outputs, timeout_seconds=10):
-#     """
-#     Returns a callable test function that runs an APPS-style program.
-#     Each input is fed via stdin, and stdout is compared to expected output.
-#     """
-#     def run(program_code: str):
-#         print("\n=== DEBUG: Starting APPS test suite ===")
-#         print("DEBUG: Received program_code:\n", program_code)
-
-#         results, passed = [], 0
-
-#         with tempfile.TemporaryDirectory() as tmpdir:
-#             src_path = os.path.join(tmpdir, "main.py")
-#             print(f"DEBUG: Writing program to temporary file: {src_path}")
-
-#             with open(src_path, "w") as f:
-#                 f.write(program_code)
-
-#             for j, (inp, out) in enumerate(zip(inputs, outputs), 1):
-#                 # print(f"--- DEBUG: Test #{j} ---")
-#                 # print(f"DEBUG: Input:\n{inp!r}")
-#                 # print(f"DEBUG: Expected Output:\n{out!r}")
-
-#                 try:
-#                     proc = subprocess.run(
-#                         ["python3", src_path],
-#                         input=inp.encode(),
-#                         capture_output=True,
-#                         timeout=timeout_seconds,
-#                     )
-#                     pred = proc.stdout.decode().strip()
-#                     gold = out.strip()
-
-#                     # print(f"DEBUG: Subprocess completed with return code {proc.returncode}")
-#                     # print(f"DEBUG: Raw stdout: {proc.stdout!r}")
-#                     # print(f"DEBUG: Decoded stdout: {pred!r}")
-#                     # print(f"DEBUG: Expected: {gold!r}")
-
-#                     if pred == gold:
-#                         print("DEBUG: Test PASSED")
-#                         passed += 1
-#                         results.append((j, "✅ PASS", inp.strip()))
-#                     else:
-#                         print("DEBUG: Test FAILED")
-#                         results.append((j, "❌ FAIL", f"Expected: {gold!r}, Got: {pred!r}"))
-#                 except subprocess.TimeoutExpired:
-#                     print(f"DEBUG: TIMEOUT (> {timeout_seconds}s)")
-#                     results.append((j, f"TIMEOUT (> {timeout_seconds}s)", inp.strip()))
-#                 except Exception as e:
-#                     print(f"DEBUG: ERROR running subprocess: {e}")
-#                     results.append((j, f"⚠️ ERROR: {e}", inp.strip()))
-
-#         total = len(inputs)
-#         score = passed / total if total else 0.0
-#         print(f"\n=== DEBUG: Final score: {score} ({passed}/{total}) ===")
-
-#         return score, results
-
-#     return run
-
-
 def make_apps_test_suite(inputs, outputs, timeout_seconds=5):
 
     def run(program_code: str):
