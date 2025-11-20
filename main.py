@@ -8,7 +8,6 @@ import textwrap
 import inspect
 import argparse
 import traceback
-import coverage
 import tempfile
 import subprocess
 from tqdm import tqdm
@@ -78,8 +77,6 @@ def build_antiunified_history(model, trajectory):
     print("\n[DEBUG] Entered build_antiunified_history()", flush=True)
 
     attempts = trajectory.get("refinement_attempts", [])
-    print(f"[DEBUG] refinement_attempts count: {len(attempts)}", flush=True)
-
     if not attempts:
         print("[DEBUG] No attempts found. Returning empty structure.", flush=True)
         return {
@@ -89,106 +86,76 @@ def build_antiunified_history(model, trajectory):
             "unique": {}
         }
 
-    # ------------------------------------------------------
-    print("[DEBUG] Calling model.generate_antiunified_history()", flush=True)
+    # Anti-unified structure
     anti_unified = model.generate_antiunified_history(trajectory)
-    print("[DEBUG] Anti-unified returned (first 200 chars):", anti_unified[:200], flush=True)
-    # ------------------------------------------------------
 
-    # These MUST match your caller:
-    failing_sets = {}   # attempt_idx -> set of test_ids
+    # Storage
+    failing_sets = {}
     overlap = set()
     unique = {}
 
-    # Helper: parse FAIL messages
-    def parse_failure_msg(msg):
+    # Helper to parse the FAIL detail field
+    def parse_failure(detail):
+        # detail is like: "Expected '4', Got '3'"
         import re
-        m = re.findall(r"Expected:\s*([^,]+)[,]?\s*Got:\s*(.*)", msg)
+        m = re.findall(r"Expected:?\s*'?(.*?)'?,?\s*Got:?\s*'?(.*?)'?$", detail)
         if m:
             expected, got = m[0]
-            return expected.strip(), got.strip()
+            return expected, got
         return None, None
 
-    # ------------------------------------------------------
-    # Process INITIAL attempt
-    # ------------------------------------------------------
-    print("[DEBUG] Processing initial test results", flush=True)
-
-    initial = trajectory.get("initial_test_results", [])
-    print(f"[DEBUG] initial_test_results length: {len(initial)}", flush=True)
+    # ========== INITIAL ATTEMPT ==========
+    print("\n[DEBUG] --- Processing initial attempt ---", flush=True)
+    init_results = trajectory["initial_test_results"]
+    init_inputs = trajectory["initial_test_inputs"]
+    init_outputs = trajectory["initial_test_outputs"]
 
     initial_fail_ids = set()
 
-    for idx, (tid, status, detail) in enumerate(initial):
-        print(f"[DEBUG] Initial test row idx={idx}, id={tid}, status={status}", flush=True)
-
+    for tid, status, detail in init_results:
         if "FAIL" in status:
-            print(f"       ↳ FAIL detected (initial). detail={detail}", flush=True)
             initial_fail_ids.add(tid)
+            expected, got = parse_failure(detail)
+
+            print(f"\n[FAIL] Initial attempt – Test {tid}", flush=True)
+            print("  input:   ", repr(init_inputs[tid-1]), flush=True)
+            print("  expected:", repr(init_outputs[tid-1]), flush=True)
+            print("  got:     ", repr(got), flush=True)
 
     failing_sets[0] = initial_fail_ids
-    print(f"[DEBUG] failing_sets[0] = {initial_fail_ids}", flush=True)
 
-    # ------------------------------------------------------
-    # Process refinement attempts
-    # ------------------------------------------------------
-    print("[DEBUG] Processing refinement attempts", flush=True)
+    # ========== REFINEMENT ATTEMPTS ==========
+    print("\n[DEBUG] --- Processing refinement attempts ---", flush=True)
 
     for j, attempt in enumerate(attempts, start=1):
-        results = attempt.get("test_results", [])
-        print(f"[DEBUG] Attempt {j}: {len(results)} test results", flush=True)
-
+        results = attempt["test_results"]
+        test_inputs = attempt["test_inputs"]
+        test_outputs = attempt["test_outputs"]
         fail_ids = set()
 
-        for row_idx, (tid, status, detail) in enumerate(results):
-            print(f"  [DEBUG] Row {row_idx}: id={tid}, status={status}", flush=True)
-
+        for tid, status, detail in results:
             if "FAIL" in status:
-                print("       ↳ FAIL detected", flush=True)
                 fail_ids.add(tid)
+                expected, got = parse_failure(detail)
+                print(f"\n[FAIL] Attempt {j} – Test {tid}", flush=True)
+                print("  input:   ", repr(test_inputs[tid-1]), flush=True)
+                print("  expected:", repr(test_outputs[tid-1]), flush=True)
+                print("  got:     ", repr(got), flush=True)
 
         failing_sets[j] = fail_ids
-        print(f"[DEBUG] failing_sets[{j}] = {fail_ids}", flush=True)
 
-    # ------------------------------------------------------
-    # Compute overlap
-    # ------------------------------------------------------
-    print("[DEBUG] Computing overlaps and unique failures", flush=True)
+    # ========== COMPUTE OVERLAP ==========
 
-    non_empty_sets = [s for s in failing_sets.values() if s]
-    print(f"[DEBUG] non_empty_sets = {non_empty_sets}", flush=True)
+    non_empty = [s for s in failing_sets.values() if s]
+    overlap = set.intersection(*non_empty) if non_empty else set()
 
-    if non_empty_sets:
-        overlap = set.intersection(*non_empty_sets)
-    else:
-        overlap = set()
+    unique = {k: v - overlap for k, v in failing_sets.items()}
 
-    print(f"[DEBUG] overlap = {overlap}", flush=True)
-
-    # Unique failing tests per attempt
-    unique = {
-        k: v - overlap
-        for k, v in failing_sets.items()
-    }
-
-    print(f"[DEBUG] unique = {unique}", flush=True)
-
-    # ------------------------------------------------------
-    # Final return
-    # ------------------------------------------------------
-    print("[DEBUG] Finished build_antiunified_history()", flush=True)
-    print("[DEBUG] Returning structure keys:", list({
+    return {
         "anti_unified": anti_unified,
         "failing_sets": failing_sets,
         "overlap": overlap,
         "unique": unique
-    }.keys()), flush=True)
-
-    return {
-        "anti_unified": anti_unified,
-        "failing_sets": failing_sets,   # <-- correct key
-        "overlap": overlap,             # <-- correct key
-        "unique": unique                # <-- correct key
     }
 
 
@@ -235,6 +202,80 @@ def run_in_subprocess(code_str, input_str, timeout=3):
         }
 
 
+def separate_pass_fail_lines(results, coverage):
+    fail_lines = []
+    pass_lines = []
+
+    for (test_id, status, _) in results:
+        lines = coverage.get(test_id, set())
+        if "PASS" in status:
+            pass_lines.append(lines)
+        else:
+            fail_lines.append(lines)
+
+    # Union (all lines ever executed in fail/pass tests)
+    fail_union = set().union(*fail_lines) if fail_lines else set()
+    pass_union = set().union(*pass_lines) if pass_lines else set()
+
+    # Lines *unique* to failing tests
+    fail_unique = fail_union - pass_union
+
+    # Lines *unique* to passing tests
+    pass_unique = pass_union - fail_union
+
+    return {
+        "fail_cases": fail_lines,
+        "pass_cases": pass_lines,
+        "fail_union": fail_union,
+        "pass_union": pass_union,
+        "fail_unique": fail_unique,
+        "pass_unique": pass_unique,
+    }
+
+
+def print_code_with_line_numbers(code_str):
+    print("\n=== Candidate Program (with line numbers) ===")
+    for idx, line in enumerate(code_str.splitlines(), start=1):
+        print(f"{idx:3d}: {line}")
+    print("===========================================\n")
+
+
+def summarize_attempt(program, results, coverage, test_inputs, test_outputs):
+    """Return a structured summary of one program attempt."""
+    failures = []
+    for tid, status, detail in results:
+        if "PASS" in status:
+            continue
+
+        input_str = test_inputs[tid - 1]
+        expected_gold = test_outputs[tid - 1]
+
+        if "FAIL" in status:
+            import re
+            m = re.findall(r"Expected:? *'?(.*?)'?,? *Got:? *'?(.*?)'?$", detail)
+            expected, got = (m[0] if m else ("?", "?"))
+        elif "TIMEOUT" in status:
+            expected, got = expected_gold, "TIMEOUT"
+        else:
+            expected, got = expected_gold, "ERROR"
+
+        failures.append({
+            "test_id": tid,
+            "status": status,
+            "input": input_str,
+            "expected": expected,
+            "got": got,
+            "executed_lines": sorted(coverage.get(tid, set())),
+        })
+
+    return {
+        "program": program,
+        "program_with_lines": print_code_with_line_numbers(program),
+        "coverage": coverage,
+        "failing_tests": failures,
+    }
+
+
 def run_self_repair(task, model, test_suite, np=5,
                     nf=1, nr=1, mode="critique+refine"):
     """
@@ -258,8 +299,6 @@ def run_self_repair(task, model, test_suite, np=5,
         seed_code = extract_code(seed)
         frac_passed, results, coverage = test_suite(seed_code)
         print(f"Seed {i} → passed {frac_passed*100:.1f}% of tests")
-
-        print(f"Coverage: {coverage}", flush=True)
 
         fully_passed = frac_passed == 1.0
 
@@ -341,6 +380,7 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
     trajectories = []
     overall_success = False
+    attempt_history = defaultdict(list)
 
     # ---------- Stage 1: Generate seeds ----------
     print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generating {np} initial seeds...", flush=True)
@@ -358,14 +398,22 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
         seed_code = extract_code(seed)
 
         try:
-            frac_passed, results, coverage = test_suite(seed_code)
+            frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
         except Exception as e:
             print(f"[ERROR {time.strftime('%H:%M:%S')}] Test suite crashed for seed {i}: {e}", flush=True)
             return None, False
 
-        print(f"Coverage: {coverage}")
+        initial_summary = summarize_attempt(
+            program=seed_code,
+            results=results,
+            coverage=coverage,
+            test_inputs=test_inputs,
+            test_outputs=test_outputs
+        )
+        attempt_history[i].append(initial_summary)
 
         fully_passed = frac_passed == 1.0
+
         trajectory = {
             "seed_index": i,
             "initial_program": seed_code,
@@ -425,45 +473,11 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                             print("[TRACE] Not enough attempts to perform anti-unification yet.", flush=True)
                             anti_unified_context = ""
                         else:
+                            print(f"Attempt history: {attempt_history}")
                             au_data = build_antiunified_history(model, trajectory)
                             anti_text = au_data["anti_unified"]
-                            failing_sets = au_data["failing_sets"]
-                            overlap = au_data["overlap"]
-                            unique = au_data["unique"]
 
                             print(f"[TRACE] Anti-unified abstraction (first 200 chars): {anti_text[:200]!r}", flush=True)
-
-                            # --------------------------------------------------
-                            # WRITE ANTI-UNIFIED ABSTRACTION TO FILE
-                            # --------------------------------------------------
-                            import os
-                            os.makedirs("antiunify_logs", exist_ok=True)
-
-                            timestamp = time.strftime("%Y%m%d-%H%M%S")
-                            fname = f"antiunify_logs/seed_{i}_attempt_{attempt_count}_{timestamp}.txt"
-
-                            with open(fname, "w", encoding="utf-8") as f:
-                                print(f"OPENED FILE!")
-                                f.write(f"Task:\n{task}\n\n")
-
-                                f.write("=== Anti-Unified Abstraction ===\n")
-                                f.write(anti_text + "\n\n")
-
-                                f.write("=== Failing Test Sets (per attempt) ===\n")
-                                for attempt_idx, fs in failing_sets.items():
-                                    f.write(f"Attempt {attempt_idx}: {sorted(fs)}\n")
-                                f.write("\n")
-
-                                f.write("=== Overlapping Failing Tests (intersection) ===\n")
-                                f.write(f"{sorted(overlap)}\n\n")
-
-                                f.write("=== Unique Failing Tests (per attempt) ===\n")
-                                for attempt_idx, uniq in unique.items():
-                                    f.write(f"Attempt {attempt_idx}: {sorted(uniq)}\n")
-                                f.write("\n")
-
-                            print(f"[TRACE] Anti-unified data written to {fname}", flush=True)
-                            # --------------------------------------------------
 
                             anti_unified_context = (
                                 "Anti-unified abstraction of previous attempts:\n"
@@ -505,8 +519,18 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             try:
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Running test suite on refined code...", flush=True)
-                frac_passed, results, coverage = test_suite(code)
+                frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
                 fully_passed = frac_passed == 1.0
+
+                attempt_summary = summarize_attempt(
+                    program=code,
+                    results=results,
+                    coverage=coverage,
+                    test_inputs=test_inputs,
+                    test_outputs=test_outputs
+                )
+                attempt_history[i].append(attempt_summary)
+
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Test suite finished (pass={frac_passed*100:.1f}%)", flush=True)
             except Exception as e:
                 print(f"[ERROR {time.strftime('%H:%M:%S')}]   Test suite crash: {e}", flush=True)
@@ -703,7 +727,7 @@ def make_apps_test_suite(inputs, outputs, timeout_seconds=5):
                 results.append((j, "FAIL", f"Expected {gold!r}, Got {model_out!r}"))
 
         score = passed / len(inputs)
-        return score, results, coverage_map
+        return score, results, coverage_map, inputs, outputs
 
     return run
 
