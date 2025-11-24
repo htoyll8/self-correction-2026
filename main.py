@@ -233,11 +233,16 @@ def separate_pass_fail_lines(results, coverage):
     }
 
 
-def print_code_with_line_numbers(code_str):
-    print("\n=== Candidate Program (with line numbers) ===")
+def code_with_line_numbers(code_str):
+    """
+    Return a pretty string of the code with line numbers.
+    """
+    out = []
+    out.append("=== Candidate Program (with line numbers) ===")
     for idx, line in enumerate(code_str.splitlines(), start=1):
-        print(f"{idx:3d}: {line}")
-    print("===========================================\n")
+        out.append(f"{idx:3d}: {line}")
+    out.append("===========================================")
+    return "\n".join(out)
 
 
 def summarize_attempt(program, results, coverage, test_inputs, test_outputs):
@@ -270,10 +275,163 @@ def summarize_attempt(program, results, coverage, test_inputs, test_outputs):
 
     return {
         "program": program,
-        "program_with_lines": print_code_with_line_numbers(program),
+        "program_with_lines": code_with_line_numbers(program),
         "coverage": coverage,
         "failing_tests": failures,
     }
+
+
+def cluster_by_expected(failing_tests):
+    """
+    Cluster test-case dictionaries by their 'expected' field.
+
+    Parameters
+    ----------
+    failing_tests : list[dict]
+        Each dict should include at least:
+        - test_id
+        - expected
+        - input
+        - got
+        - executed_lines
+        - status
+
+    Returns
+    -------
+    dict[str, list[dict]]
+        Mapping: expected_value -> list of test-case dictionaries.
+    """
+
+    clusters = {}
+
+    for t in failing_tests:
+        exp = t.get("expected", None)
+
+        if exp not in clusters:
+            clusters[exp] = []
+
+        clusters[exp].append(t)
+
+    return clusters
+
+
+def cluster_by_executed_lines(failing_tests):
+    """
+    failing_tests: list of dicts with fields:
+        - test_id
+        - input
+        - expected
+        - got
+        - executed_lines (list or set of ints)
+
+    Returns: dict { tuple(sorted_lines) : [test_info, ...] }
+    """
+    clusters = {}
+    for t in failing_tests:
+        key = tuple(sorted(t.get("executed_lines", [])))
+        clusters.setdefault(key, []).append(t)
+    return clusters
+
+
+def summarize_clusters(clusters):
+    parts = []
+    for expected_val, tests in clusters.items():
+        parts.append(f"### Expected Output = {expected_val!r} ({len(tests)} tests)\n")
+        for t in tests[:8]:  # show up to 8 examples
+            parts.append(
+                f"- Test {t['test_id']}: got {t['got']!r}, input={t['input']!r}"
+            )
+        parts.append("")  # blank line
+    return "\n".join(parts)
+
+
+def summarize_exec_clusters(clusters):
+    """
+    clusters: dict from cluster key to list of test dicts
+    Returns a big formatted string.
+    """
+    parts = []
+    for exec_lines, tests in clusters.items():
+        header = f"=== Executed lines: {list(exec_lines)} | {len(tests)} tests ==="
+        block = [header]
+        for t in tests[:6]:  # sample first 6
+            block.append(
+                f"  • Test {t['test_id']} | expected={t['expected']!r}, got={t['got']!r}, input={t['input']!r}"
+            )
+        parts.append("\n".join(block))
+    return "\n\n".join(parts)
+
+
+def summarize_full_history_for_prompt(history):
+    """
+    Return a clean human-readable text block for the prompt.
+    Includes:
+      - failing-test counts
+      - full program text with line numbers for each attempt
+      - delta analysis across attempts
+    """
+
+    lines = []
+
+    # =====================================================
+    # 1. HIGH-LEVEL SUMMARY
+    # =====================================================
+    lines.append("### Previous Attempts Summary\n")
+    for idx, h in enumerate(history):
+        num_fail = len(h["failing_tests"])
+        lines.append(f"Attempt {idx}: {num_fail} failing tests")
+
+    # =====================================================
+    # 2. PROGRAM WITH LINE NUMBERS PER ATTEMPT
+    # =====================================================
+    lines.append("\n### Program Versions Across Attempts\n")
+
+    for idx, h in enumerate(history):
+        prog = h["program_with_lines"]
+        lines.append(f"\n--- Attempt {idx} Program ---\n{prog}")
+
+    # =====================================================
+    # 3. DELTA SUMMARY (fixed/new/persisting)
+    # =====================================================
+    lines.append("\n### Changes Across Attempts\n")
+
+    deltas = compute_deltas(history)
+    for d in deltas:
+        lines.append(f"- From attempt {d['prev_attempt']} → {d['attempt']}:")
+        lines.append(f"    • Fixed tests: {d['became_fixed']}")
+        lines.append(f"    • Newly failing: {d['newly_failed']}")
+        lines.append(f"    • Persisting failures: {d['persisted']}")
+
+    return "\n".join(lines)
+
+
+def compute_deltas(history):
+    """
+    Compare failing tests across all pairs of attempts.
+    Returns a nice dict structure summarizing what changed.
+    """
+    deltas = []
+
+    for t in range(1, len(history)):
+        prev = history[t-1]["failing_tests"]
+        curr = history[t]["failing_tests"]
+
+        prev_ids = {f["test_id"] for f in prev}
+        curr_ids = {f["test_id"] for f in curr}
+
+        became_fixed = sorted(prev_ids - curr_ids)
+        newly_failed = sorted(curr_ids - prev_ids)
+        persisted = sorted(curr_ids & prev_ids)
+
+        deltas.append({
+            "attempt": t,
+            "prev_attempt": t-1,
+            "became_fixed": became_fixed,
+            "newly_failed": newly_failed,
+            "persisted": persisted,
+        })
+
+    return deltas
 
 
 def run_self_repair(task, model, test_suite, np=5,
@@ -369,7 +527,14 @@ def run_self_repair(task, model, test_suite, np=5,
     }
 
 
-def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mode="critique+refine"):
+def run_self_repair_iterative(
+        task,
+        model,
+        test_suite,
+        np=5,
+        max_attempts=10,
+        mode="critique+refine",
+        use_coverage=False):
     """
     Perform iterative self-repair with multiple independent seeds (np),
     refined in parallel using threads.
@@ -398,7 +563,13 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
         seed_code = extract_code(seed)
 
         try:
-            frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
+            if use_coverage:
+                frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
+            else:
+                frac_passed, results = test_suite(seed_code)
+                coverage = None
+                test_inputs = None
+                test_outputs = None
         except Exception as e:
             print(f"[ERROR {time.strftime('%H:%M:%S')}] Test suite crashed for seed {i}: {e}", flush=True)
             return None, False
@@ -406,9 +577,9 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
         initial_summary = summarize_attempt(
             program=seed_code,
             results=results,
-            coverage=coverage,
-            test_inputs=test_inputs,
-            test_outputs=test_outputs
+            coverage=coverage if use_coverage else None,
+            test_inputs=test_inputs if use_coverage else None,
+            test_outputs=test_outputs if use_coverage else None,
         )
         attempt_history[i].append(initial_summary)
 
@@ -437,8 +608,13 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
             print(f"[DEBUG {time.strftime('%H:%M:%S')}]   Seed {i}, Attempt {attempt_count} starting...", flush=True)
             feedback = None
 
-            if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine"):
+            if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine", "critique+antiunify+execclusters+refine"):
                 try:
+                    if not use_coverage and mode.endswith("execclusters+refine"):
+                        print("[WARN] execclusters mode disabled (no coverage). Falling back to expected-value clustering.", flush=True)
+                        # Replace with:
+                        mode = "critique+antiunify+refine"
+
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Generating feedback...", flush=True)
 
                     if mode == "critique+refine":
@@ -465,33 +641,60 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
                         )
 
                     elif mode == "critique+antiunify+refine":
-                        # Build anti-unified abstraction of all prior programs
-                        attempts = trajectory.get("refinement_attempts", [])
-                        print(f"[TRACE] {len(attempts)} previous attempts in trajectory.", flush=True)
+                        history = attempt_history[i]
+                        # print(f"History: {history}")
 
-                        if len(attempts) < 2:
-                            print("[TRACE] Not enough attempts to perform anti-unification yet.", flush=True)
-                            anti_unified_context = ""
-                        else:
-                            print(f"Attempt history: {attempt_history}")
-                            au_data = build_antiunified_history(model, trajectory)
-                            anti_text = au_data["anti_unified"]
+                        # Current attempt = last entry
+                        cur_attempt = history[-1]
+                        failing_tests = cur_attempt["failing_tests"]
+                        program_with_lines = cur_attempt["program_with_lines"]
 
-                            print(f"[TRACE] Anti-unified abstraction (first 200 chars): {anti_text[:200]!r}", flush=True)
+                        # Cluster failing tests
+                        clusters = cluster_by_expected(failing_tests)
 
-                            anti_unified_context = (
-                                "Anti-unified abstraction of previous attempts:\n"
-                                f"{anti_text}\n\n"
-                            )
+                        # Produce nice text summary
+                        failing_tests_summary = summarize_clusters(clusters)
+
+                        current_pass = trajectory["refinement_attempts"][-1]["pass_fraction"] * 100
+
+                        # ---- Build final feedback prompt ----
+                        feedback_input = (
+                            f"Task description:\n{task}\n\n"
+                            f"Current program to critique (pass={current_pass:.1f}%):\n"
+                            f"{program_with_lines}\n\n"
+                            f"Summary of failing tests:\n{failing_tests_summary}\n"
+                        )
+
+                    elif mode == "critique+antiunify+execclusters+refine":
+                        history = attempt_history[i]
+
+                        # --- Full history (deltas + summaries) ---
+                        history_summary_text = summarize_full_history_for_prompt(history)
+
+                        # --- Current attempt info ---
+                        cur_attempt = history[-1]
+                        failing_tests = cur_attempt["failing_tests"]
+                        program_with_lines = cur_attempt["program_with_lines"]
+
+                        # Cluster failing tests
+                        clusters = cluster_by_expected(failing_tests)
+
+                        # Produce nice text summary
+                        cluster_summary = summarize_clusters(clusters)
 
                         current_pass = trajectory["refinement_attempts"][-1]["pass_fraction"] * 100
 
                         feedback_input = (
                             f"Task description:\n{task}\n\n"
-                            f"{anti_unified_context}"
-                            f"Current program to critique "
-                            f"(pass={current_pass:.1f}%):\n"
-                            f"{current_program}"
+
+                            f"### Full Attempt History\n"
+                            f"{history_summary_text}\n\n"
+
+                            f"### Current Program (pass={current_pass:.1f}%)\n"
+                            f"{program_with_lines}\n\n"
+
+                            f"### Failing Tests (Clustered by Input)\n"
+                            f"{cluster_summary}\n"
                         )
 
                     print(f"Feedback input: {feedback_input}", flush=True)
@@ -504,7 +707,12 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             try:
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Refining program...", flush=True)
-                if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine"):
+                if mode in (
+                    "critique+refine",
+                    "critique+history+refine",
+                    "critique+antiunify+refine",
+                    "critique+antiunify+execclusters+refine"
+                ):
                     refined = safe_call(model.refine, task, current_program, feedback, 0, timeout=120)
                 elif mode == "direct":
                     refined = safe_call(model.refine, task, current_program, 0, timeout=120)
@@ -519,15 +727,22 @@ def run_self_repair_iterative(task, model, test_suite, np=5, max_attempts=10, mo
 
             try:
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Running test suite on refined code...", flush=True)
-                frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
+                if use_coverage:
+                    frac_passed, results, coverage, test_inputs, test_outputs = test_suite(code)
+                else:
+                    frac_passed, results = test_suite(code)
+                    coverage = None
+                    test_inputs = None
+                    test_outputs = None
+
                 fully_passed = frac_passed == 1.0
 
                 attempt_summary = summarize_attempt(
                     program=code,
                     results=results,
-                    coverage=coverage,
-                    test_inputs=test_inputs,
-                    test_outputs=test_outputs
+                    coverage=coverage if use_coverage else None,
+                    test_inputs=test_inputs if use_coverage else None,
+                    test_outputs=test_outputs if use_coverage else None
                 )
                 attempt_history[i].append(attempt_summary)
 
@@ -936,7 +1151,8 @@ def main():
             "direct",
             "critique+refine",
             "critique+history+refine",
-            "critique+antiunify+refine"
+            "critique+antiunify+refine",
+            "critique+antiunify+execclusters+refine"
         ],
         default="critique+refine",
         help=(
