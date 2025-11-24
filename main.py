@@ -567,6 +567,8 @@ def run_self_repair_iterative(
                 frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
             else:
                 frac_passed, results = test_suite(seed_code)
+                print(f"DEBUG: fraction passed {frac_passed}", flush=True)
+                print(f"DEBUG: results {results}", flush=True)
                 coverage = None
                 test_inputs = None
                 test_outputs = None
@@ -574,14 +576,18 @@ def run_self_repair_iterative(
             print(f"[ERROR {time.strftime('%H:%M:%S')}] Test suite crashed for seed {i}: {e}", flush=True)
             return None, False
 
-        initial_summary = summarize_attempt(
-            program=seed_code,
-            results=results,
-            coverage=coverage if use_coverage else None,
-            test_inputs=test_inputs if use_coverage else None,
-            test_outputs=test_outputs if use_coverage else None,
-        )
-        attempt_history[i].append(initial_summary)
+        if use_coverage:
+            initial_summary = summarize_attempt(
+                program=seed_code,
+                results=results,
+                coverage=coverage,
+                test_inputs=test_inputs,
+                test_outputs=test_outputs,
+            )
+            print(f"DEBUG: Initial summary: {initial_summary}", flush=True)
+            attempt_history[i].append(initial_summary)
+        else:
+            print(f"DEBUG: Skipping summarize_attempt (use_coverage=False)", flush=True)
 
         fully_passed = frac_passed == 1.0
 
@@ -593,6 +599,7 @@ def run_self_repair_iterative(
             "initial_test_results": results,
             "refinement_attempts": []
         }
+        print(f"DEBUG: Trajectory: {trajectory}", flush=True)
 
         if fully_passed:
             print(f"[INFO {time.strftime('%H:%M:%S')}] Seed {i} ✅ passed all tests initially ({frac_passed*100:.1f}%)", flush=True)
@@ -610,11 +617,6 @@ def run_self_repair_iterative(
 
             if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine", "critique+antiunify+execclusters+refine"):
                 try:
-                    if not use_coverage and mode.endswith("execclusters+refine"):
-                        print("[WARN] execclusters mode disabled (no coverage). Falling back to expected-value clustering.", flush=True)
-                        # Replace with:
-                        mode = "critique+antiunify+refine"
-
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Generating feedback...", flush=True)
 
                     if mode == "critique+refine":
@@ -737,14 +739,17 @@ def run_self_repair_iterative(
 
                 fully_passed = frac_passed == 1.0
 
-                attempt_summary = summarize_attempt(
-                    program=code,
-                    results=results,
-                    coverage=coverage if use_coverage else None,
-                    test_inputs=test_inputs if use_coverage else None,
-                    test_outputs=test_outputs if use_coverage else None
-                )
-                attempt_history[i].append(attempt_summary)
+                if use_coverage:
+                    attempt_summary = summarize_attempt(
+                        program=code,
+                        results=results,
+                        coverage=coverage,
+                        test_inputs=test_inputs,
+                        test_outputs=test_outputs,
+                    )
+                    attempt_history[i].append(attempt_summary)
+                else:
+                    print(f"[DEBUG] Skipping summarize_attempt (use_coverage=False)", flush=True)
 
                 print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Test suite finished (pass={frac_passed*100:.1f}%)", flush=True)
             except Exception as e:
@@ -960,7 +965,7 @@ def make_humaneval_test_suite(tests: str, entry_point: str, language="python", t
                 except TimeoutException:
                     print("DEBUG: TIMEOUT")
                     results.append((i, f"TIMEOUT (> {timeout_seconds}s)", assert_line))
-                except AssertionError:
+                except AssertionError as e:
                     print("DEBUG: ASSERTION FAILED:", e)
                     results.append((i, "❌ FAIL", assert_line))
                 except Exception as e:
