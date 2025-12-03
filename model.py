@@ -21,10 +21,15 @@ class Model:
         responses = []
 
         for _ in range(n):
-            # Build base request
             request = dict(
                 model=self.model_name,
-                input=task_description,
+                input=(
+                    task_description +
+                    "Please provide Python code wrapped in triple backticks like:\n"
+                    "```python\n"
+                    "# your code here\n"
+                    "```\n\n"
+                ),
             )
 
             # Add temperature only if supported
@@ -50,15 +55,17 @@ class Model:
         has_history = "Summary of previous attempts:" in program_or_context
 
         # Dynamically adjust the label
-        section_label = "Context (previous attempts and current program)" if has_history else "Program"
+        section_label = "Context (previous attempts and current program)" if has_history else "Program to Critique"
 
         # Build prompt
         prompt = (
             f"The following attempt did not pass all of its tests.\n\n"
+            f"Please explain what might be wrong.\n\n"
             f"Task:\n{task_description}\n\n"
             f"{section_label}:\n{program_or_context}\n\n"
-            f"Please explain what might be wrong and how to fix it."
         )
+
+        print(f"DEBUG [model.py]: Feedback prompt: {prompt}", flush=True)
 
         # Construct request
         request = {

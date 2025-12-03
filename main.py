@@ -20,6 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess, json, tempfile, sys
 from pathlib import Path
 from threading import Lock
+import multiprocessing
+
+multiprocessing.set_start_method("spawn", force=True)
 coverage_lock = Lock()
 
 from model import Model
@@ -34,14 +37,81 @@ def safe_call(fn, *args, timeout=90):
         return future.result(timeout=timeout)
 
 
-def extract_function_name_from_code(code: str) -> str | None:
+WRAPPER_FUNCS = {
+    "set", "sorted", "list", "tuple", "dict",
+    "len", "max", "min", "sum", "all", "any"
+}
+
+
+def split_top_level_args(s: str):
     """
-    Extracts the function name from a reference MBPP code snippet.
-    Example:
-      'def similar_elements(test_tup1, test_tup2):' -> 'similar_elements'
+    Split argument list on commas at top level only.
+    Handles nested parentheses/brackets/braces.
     """
-    match = re.search(r"def\s+([a-zA-Z_]\w*)\s*\(", code)
-    return match.group(1) if match else None
+    args = []
+    buf = []
+    depth = 0
+
+    for ch in s:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+
+        if ch == "," and depth == 0:
+            args.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+
+    if buf:
+        args.append("".join(buf).strip())
+
+    return args
+
+
+WRAPPER_FUNCS = {"set", "sorted", "list", "tuple"}
+
+
+def extract_function_signature(assert_lines):
+    for line in assert_lines:
+        lhs = line.split("==")[0]
+
+        i = 0
+        func_start = None
+
+        while i < len(lhs):
+            ch = lhs[i]
+
+            if ch.isalpha() or ch == "_":
+                if func_start is None:
+                    func_start = i
+            else:
+                if func_start is not None:
+                    name = lhs[func_start:i]
+
+                    # check '(' right after name
+                    if i < len(lhs) and lhs[i] == "(":
+                        # parse args
+                        paren = 1
+                        j = i + 1
+                        while j < len(lhs) and paren > 0:
+                            if lhs[j] == "(":
+                                paren += 1
+                            elif lhs[j] == ")":
+                                paren -= 1
+                            j += 1
+
+                        if paren == 0:
+                            if name not in WRAPPER_FUNCS:
+                                raw_args = lhs[i+1 : j-1]
+                                args = split_top_level_args(raw_args)
+                                return name, len(args)
+
+                    func_start = None
+            i += 1
+
+    return None, None
 
 
 def build_feedback_history(trajectory):
@@ -160,38 +230,49 @@ def build_antiunified_history(model, trajectory):
 
 
 def run_in_subprocess(code_str, input_str, timeout=3):
-    """Runs code_str on input_str inside a fully isolated Python subprocess."""
+    """Runs code_str on input_str inside a fully isolated Python subprocess.
+       This version guarantees kill of the full process group.
+    """
     payload = json.dumps({
         "code": code_str,
         "input": input_str
     })
 
+    # Launch subprocess in its own process group
     proc = subprocess.Popen(
         [sys.executable, TRACE_RUNNER],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        preexec_fn=os.setsid  # <-- start new process group so we can kill everything
     )
 
     try:
         out, err = proc.communicate(payload, timeout=timeout)
+
     except subprocess.TimeoutExpired:
-        proc.kill()
+        # Kill the entire process group (proc + any children)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            proc.kill()
+
         return {
             "output": None,
             "coverage": [],
             "error": "TIMEOUT"
         }
 
+    # stderr from runner means program-level error
     if err:
-        # Any stderr from the runner itself
         return {
             "output": None,
             "coverage": [],
             "error": "RunnerError:\n" + err
         }
 
+    # JSON decode the coverage + output payload
     try:
         return json.loads(out)
     except json.JSONDecodeError:
@@ -243,6 +324,20 @@ def code_with_line_numbers(code_str):
         out.append(f"{idx:3d}: {line}")
     out.append("===========================================")
     return "\n".join(out)
+
+
+def format_raw_execution_results(results):
+    """
+    Format test results exactly like HumanEval/APPS JSON triples.
+    Example output:
+      [1, "❌ FAIL", "assert candidate(12, 2) == '12'"]
+    """
+    lines = []
+    for tid, status, detail in results:
+        # Escape internal quotes if needed
+        safe_detail = detail.replace('"', '\\"')
+        lines.append(f"[{tid}, \"{status}\", \"{safe_detail}\"]")
+    return "\n".join(lines)
 
 
 def summarize_attempt(program, results, coverage, test_inputs, test_outputs):
@@ -494,7 +589,7 @@ def run_self_repair(task, model, test_suite, np=5,
                     raise ValueError("Unknown refinement mode")
 
                 code = extract_code(refined)
-                frac_passed, results, coverage = test_suite(code)
+                frac_passed, results = test_suite(code)
                 fully_passed = frac_passed == 1.0
                 print(f"✅ success ({frac_passed*100:.1f}%)" if fully_passed else f"failed ({frac_passed*100:.1f}%)")
 
@@ -547,6 +642,8 @@ def run_self_repair_iterative(
     overall_success = False
     attempt_history = defaultdict(list)
 
+    print(f"Task at top: {task}", flush=True)
+
     # ---------- Stage 1: Generate seeds ----------
     print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generating {np} initial seeds...", flush=True)
     try:
@@ -567,8 +664,6 @@ def run_self_repair_iterative(
                 frac_passed, results, coverage, test_inputs, test_outputs = test_suite(seed_code)
             else:
                 frac_passed, results = test_suite(seed_code)
-                print(f"DEBUG: fraction passed {frac_passed}", flush=True)
-                print(f"DEBUG: results {results}", flush=True)
                 coverage = None
                 test_inputs = None
                 test_outputs = None
@@ -599,7 +694,6 @@ def run_self_repair_iterative(
             "initial_test_results": results,
             "refinement_attempts": []
         }
-        print(f"DEBUG: Trajectory: {trajectory}", flush=True)
 
         if fully_passed:
             print(f"[INFO {time.strftime('%H:%M:%S')}] Seed {i} ✅ passed all tests initially ({frac_passed*100:.1f}%)", flush=True)
@@ -615,13 +709,37 @@ def run_self_repair_iterative(
             print(f"[DEBUG {time.strftime('%H:%M:%S')}]   Seed {i}, Attempt {attempt_count} starting...", flush=True)
             feedback = None
 
-            if mode in ("critique+refine", "critique+history+refine", "critique+antiunify+refine", "critique+antiunify+execclusters+refine"):
+            if mode in ("critique+refine",
+                        "critique+history+refine",
+                        "critique+execresults+refine",
+                        "critique+antiunify+refine",
+                        "critique+antiunify+execclusters+refine"):
                 try:
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   → Generating feedback...", flush=True)
 
                     if mode == "critique+refine":
                         # Standard: feedback only based on current program
                         feedback_input = current_program
+
+                    elif mode == "critique+execresults+refine":
+                        # Determine latest test results (initial or refined)
+                        if trajectory["refinement_attempts"]:
+                            last_results = trajectory["refinement_attempts"][-1]["test_results"]
+                            current_pass = trajectory["refinement_attempts"][-1]["pass_fraction"] * 100
+                        else:
+                            last_results = trajectory["initial_test_results"]
+                            current_pass = trajectory["initial_pass_fraction"] * 100
+
+                        raw_exec_text = format_raw_execution_results(last_results)
+
+                        feedback_input = (
+                            f"Task description:\n{task}\n\n"
+                            f"Current program (pass={current_pass:.1f}%):\n"
+                            f"{current_program}\n\n"
+                            f"### Execution results (raw):\n"
+                            f"{raw_exec_text}\n\n"
+                            f"Based on these exact test results, refine the program."
+                        )
 
                     elif mode == "critique+history+refine":
                         history_context = build_feedback_history(trajectory)
@@ -699,6 +817,7 @@ def run_self_repair_iterative(
                             f"{cluster_summary}\n"
                         )
 
+                    print(f"Task before input: {task}")
                     print(f"Feedback input: {feedback_input}", flush=True)
                     feedback = safe_call(model.generate_feedback, task, feedback_input, 0, timeout=90)
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Feedback received ({len(feedback) if feedback else 0} chars)", flush=True)
@@ -778,6 +897,7 @@ def run_self_repair_iterative(
         if not seed_success:
             print(f"[FAIL {time.strftime('%H:%M:%S')}] ❌ Seed {i} exhausted {max_attempts} attempts "
                   f"({time.time()-seed_start:.1f}s elapsed)", flush=True)
+            return trajectory, False
 
         return trajectory, seed_success
 
@@ -786,14 +906,47 @@ def run_self_repair_iterative(
     with ThreadPoolExecutor(max_workers=min(np, 5)) as executor:
         futures = [executor.submit(process_seed, i, seed) for i, seed in enumerate(seeds, start=1)]
 
-        for fut in as_completed(futures):
+        SEED_TIMEOUT = 120  # seconds per seed
+
+        # for fut in as_completed(futures, timeout=np * SEED_TIMEOUT):
+        #     try:
+        #         trajectory, success = fut.result(timeout=SEED_TIMEOUT)
+        #         if trajectory:
+        #             trajectories.append(trajectory)
+        #             overall_success = overall_success or success
+        #     except concurrent.futures.TimeoutError:
+        #         print(f"[ERROR] Seed thread timed out after {SEED_TIMEOUT} seconds — marking as failure.")
+        #         # You must mark something to keep system consistent:
+        #         trajectories.append({
+        #             "seed_index": -1,
+        #             "initial_passed": False,
+        #             "initial_pass_fraction": 0.0,
+        #             "initial_program": "(timeout)",
+        #             "refinement_attempts": []
+        #         })
+        #     except Exception as e:
+        #         print(f"[ERROR] Seed thread crashed: {e}")
+
+        for fut in futures:
             try:
-                trajectory, success = fut.result()
+                # Per-seed timeout, not global timeout
+                trajectory, success = fut.result(timeout=SEED_TIMEOUT)
                 if trajectory:
                     trajectories.append(trajectory)
                     overall_success = overall_success or success
+
+            except concurrent.futures.TimeoutError:
+                print(f"[ERROR] Seed thread timed out after {SEED_TIMEOUT}s — marking as failure.")
+                trajectories.append({
+                    "seed_index": -1,
+                    "initial_passed": False,
+                    "initial_pass_fraction": 0.0,
+                    "initial_program": "(timeout)",
+                    "refinement_attempts": []
+                })
+
             except Exception as e:
-                print(f"[ERROR {time.strftime('%H:%M:%S')}] Exception in seed thread: {e}", flush=True)
+                print(f"[ERROR] Seed thread crashed: {e}")
 
     # ---------- Stage 3: Aggregate results ----------
     total_programs = sum(1 + len(t["refinement_attempts"]) for t in trajectories)
@@ -845,8 +998,9 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
                 exec(test, env)
                 passed += 1
                 results.append((i, "✅ PASS", test))
-            except AssertionError:
+            except AssertionError as e:
                 results.append((i, "❌ FAIL", test))
+                print("DEBUG: ASSERTION FAILED:", e)
             except Exception as e:
                 tb = traceback.format_exception_only(type(e), e)[0].strip()
                 results.append((i, f"⚠️ ERROR: {tb}", test))
@@ -886,7 +1040,8 @@ def make_apps_test_suite(inputs, outputs, timeout_seconds=5):
                 results.append((j, "FAIL", f"Expected {gold!r}, Got {model_out!r}"))
 
         score = passed / len(inputs)
-        return score, results, coverage_map, inputs, outputs
+        # return score, results, coverage_map, inputs, outputs
+        return score, results
 
     return run
 
@@ -1157,6 +1312,7 @@ def main():
             "critique+refine",
             "critique+history+refine",
             "critique+antiunify+refine",
+            "critique+execresults+refine",
             "critique+antiunify+execclusters+refine"
         ],
         default="critique+refine",
@@ -1166,6 +1322,10 @@ def main():
             "or 'critique+history+refine' (feedback using full past trajectory)."
         )
     )
+    parser.add_argument(
+        "--start_task_id",
+        type=int, default=None,
+        help="Start running MBPP from this task_id onward.")
 
     args = parser.parse_args()
 
@@ -1191,20 +1351,31 @@ def main():
         print(f"Loaded MBPP with {len(selected)} test tasks.")
 
         for i, ex in enumerate(tqdm(selected, desc="Running MBPP tasks")):
+            task_id = ex["task_id"]
+
+            # --- Skip until start_task_id ---
+            print(f"Start index: {args.start_task_id}")
+            print(f"i: {i}")
+            if args.start_task_id is not None and i < args.start_task_id:
+                continue
+
             if args.max_tasks and i >= args.max_tasks:
                 break
 
-            task_id, desc, setup, tests, ref_code = (
-                ex["task_id"],
-                ex["prompt"],
-                ex["test_imports"],
-                ex["test_list"],
-                ex.get("code", "")
-            )
+            desc = ex["prompt"]
+            setup = ex["test_imports"]
+            tests = ex["test_list"]
+            ref_code = ex.get("code", "")
 
-            func_name = extract_function_name_from_code(ref_code)
+            func_name, param_count = extract_function_signature(tests)
+            print(f"Tests: {tests}", flush=True)
+            print(f"Func name: {func_name}", flush=True)
+
             if func_name:
-                desc += f"\n\nThe function should be named `{func_name}`."
+                desc += f"\nMAKE SURE THE FUNCTION IS NAMED `{func_name}`."
+
+            if param_count is not None:
+                desc += f"\nTHE FUNCTION MUST TAKE EXACTLY {param_count} PARAMETER(S)."
 
             test_suite = make_mbpp_test_suite(setup, tests)
             if args.mode == "iterative":
@@ -1227,6 +1398,12 @@ def main():
         print(f"Loaded HumanEval with {len(selected)} test tasks.")
 
         for i, ex in enumerate(tqdm(selected, desc="Running HumanEval tasks")):
+            # --- Skip until start_task_id ---
+            print(f"Start index: {args.start_task_id}")
+            print(f"i: {i}")
+            if args.start_task_id is not None and i < args.start_task_id:
+                continue
+
             if args.max_tasks and i >= args.max_tasks:
                 break
             task_id, prompt, tests, entry_point = (
