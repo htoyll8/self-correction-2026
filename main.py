@@ -629,7 +629,8 @@ def run_self_repair_iterative(
         np=5,
         max_attempts=10,
         mode="critique+refine",
-        use_coverage=False):
+        use_coverage=False,
+        language="python"):
     """
     Perform iterative self-repair with multiple independent seeds (np),
     refined in parallel using threads.
@@ -642,12 +643,10 @@ def run_self_repair_iterative(
     overall_success = False
     attempt_history = defaultdict(list)
 
-    print(f"Task at top: {task}", flush=True)
-
     # ---------- Stage 1: Generate seeds ----------
     print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generating {np} initial seeds...", flush=True)
     try:
-        seeds = model.generate(task_description=task, n=np, temperature=0.7)
+        seeds = model.generate(task_description=task, n=np, temperature=0.7, language=language)
         print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generated {len(seeds)} seeds successfully.", flush=True)
     except Exception as e:
         print(f"[ERROR {time.strftime('%H:%M:%S')}] Seed generation failed: {e}", flush=True)
@@ -817,8 +816,6 @@ def run_self_repair_iterative(
                             f"{cluster_summary}\n"
                         )
 
-                    print(f"Task before input: {task}")
-                    print(f"Feedback input: {feedback_input}", flush=True)
                     feedback = safe_call(model.generate_feedback, task, feedback_input, 0, timeout=90)
                     print(f"[TRACE {time.strftime('%H:%M:%S')}]   ← Feedback received ({len(feedback) if feedback else 0} chars)", flush=True)
 
@@ -963,10 +960,11 @@ def run_self_repair_iterative(
 
 def extract_code(text: str) -> str:
     """
-    Extracts the Python code block from an LLM output string.
+    Extracts a code block from an LLM output string.
+    Strips any language tag (python, java, cpp, etc.) that follows the opening fence.
     If no ``` fences are found, returns the whole string.
     """
-    code_blocks = re.findall(r"```(?:python)?(.*?)```", text, flags=re.DOTALL)
+    code_blocks = re.findall(r"```(?:\w+)?(.*?)```", text, flags=re.DOTALL)
     if code_blocks:
         return code_blocks[0].strip()
     else:
@@ -1019,8 +1017,15 @@ def make_apps_test_suite(inputs, outputs, timeout_seconds=5):
         coverage_map = {}
 
         for j, (inp, out) in enumerate(zip(inputs, outputs), start=1):
+            # print(f"\n[DEBUG] Running test #{j}", flush=True)
+            # print("[DEBUG] Input:", flush=True)
+            # print(repr(inp), flush=True)
+            # print("[DEBUG] Expected output:", flush=True)
+            # print(repr(out), flush=True)
 
             r = run_in_subprocess(program_code, inp, timeout=timeout_seconds)
+            # print("[DEBUG] Subprocess output:", repr(r["output"]), flush=True)
+            # print("[DEBUG] Error:", r["error"], flush=True)
 
             model_out = r["output"]
             cov = set(r["coverage"])
@@ -1221,18 +1226,20 @@ return 0;
     def run_java(program_code: str):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "Main.java")
+            # src_path = os.path.join(tmpdir, "Solution.java")
             test_code = (
-                "public class Main {\n"
                 f"{program_code}\n"
-                "public static void main(String[] args) {\n"
-                f"{tests}\nSystem.out.println(\"ALL TESTS PASSED\");\n}}\n"
+                f"{tests}"
             )
+            print(f"Test code: {test_code}", flush=True)
+
             with open(src_path, "w") as f:
                 f.write(test_code)
 
             compile_result = subprocess.run(
                 ["javac", src_path], capture_output=True, text=True
             )
+
             if compile_result.returncode != 0:
                 return 0.0, [("❌ COMPILE ERROR", compile_result.stderr.strip())]
 
@@ -1272,7 +1279,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run self-repair on MBPP or HumanEval.")
     parser.add_argument(
         "--dataset",
-        choices=["mbpp", "humaneval", "humaneval-x", "apps"],
+        choices=["mbpp", "mbppplus", "humaneval", "humaneval-x", "apps"],
         required=True
     )
     parser.add_argument("--np", type=int, default=5, help="Number of seeds")
@@ -1333,7 +1340,17 @@ def main():
 
     # ---------- Prepare output file early ----------
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_path = f"results/results_{args.model_name}_{args.dataset}_{timestamp}.jsonl"
+
+    refine_tag = args.refine_mode.replace("+", "-")
+
+    out_path = (
+        f"results/results_"
+        f"{args.model_name}_"
+        f"{args.dataset}_"
+        f"{args.difficulty}_"      # <-- add this line
+        f"{refine_tag}_"
+        f"{timestamp}.jsonl"
+    )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     f = open(out_path, "w", encoding="utf-8")
 
@@ -1343,6 +1360,66 @@ def main():
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())  # ensure data is physically written to disk
+
+    # ---------- Select dataset ----------
+    if args.dataset == "mbppplus":
+        ds = load_dataset("evalplus/mbppplus")["test"]
+
+        selected = (
+            ds if args.task_ids is None
+            else [ex for ex in ds if str(ex["task_id"]) in args.task_ids]
+        )
+
+        print(f"Loaded MBPP+ with {len(selected)} test tasks.")
+
+        for i, ex in enumerate(tqdm(selected, desc="Running MBPP+ tasks")):
+            task_id = ex["task_id"]
+
+            # --- Skip until start_task_id ---
+            if args.start_task_id is not None and i < args.start_task_id:
+                print(f"Skipping: {i}")
+                continue
+
+            if args.max_tasks and i >= args.max_tasks:
+                break
+
+            desc = ex["prompt"]
+            setup = ex["test_imports"]
+            tests = ex["test_list"]     # public tests
+            ref_code = ex.get("code", "")
+
+            func_name, param_count = extract_function_signature(tests)
+
+            if func_name:
+                desc += f"\nMAKE SURE THE FUNCTION IS NAMED `{func_name}`."
+
+            if param_count is not None:
+                desc += f"\nTHE FUNCTION MUST TAKE EXACTLY {param_count} PARAMETER(S)."
+
+            test_suite = make_mbpp_test_suite(setup, tests)
+
+            if args.mode == "iterative":
+                result = run_self_repair_iterative(
+                    task=desc,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    max_attempts=args.max_attempts,
+                    mode=args.refine_mode
+                )
+            else:
+                result = run_self_repair(
+                    task=desc,
+                    model=model,
+                    test_suite=test_suite,
+                    np=args.np,
+                    nf=args.nf,
+                    nr=args.nr
+                )
+
+            result["dataset"] = "mbppplus"
+            result["task_id"] = task_id
+            write_result(result)
 
     # ---------- Select dataset ----------
     if args.dataset == "mbpp":
@@ -1442,7 +1519,8 @@ def main():
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
                     task=prompt, model=model, test_suite=test_suite,
-                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode
+                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode,
+                    language=args.language
                 )
             else:
                 result = run_self_repair(
@@ -1479,9 +1557,16 @@ def main():
                 print(f"[INFO] Reached max_tasks limit ({args.max_tasks}), stopping early.", flush=True)
                 break
 
+            # --- Skip until start_task_id ---
+            print(f"Start index: {args.start_task_id}")
+            print(f"i: {i}")
+            if args.start_task_id is not None and i < args.start_task_id:
+                continue
+
             problem_id = ex["problem_id"]
             prompt = ex["question"]
             difficulty = ex.get("difficulty", "unknown")
+            solutions = ex.get("solutions")
 
             print(f"\n[INFO] --- Task {i+1}/{len(selected)} ---", flush=True)
             print(f"[INFO] Problem ID: {problem_id}, Difficulty: {difficulty}", flush=True)
