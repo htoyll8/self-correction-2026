@@ -550,7 +550,7 @@ def run_self_repair(task, model, test_suite, np=5,
 
     for i, seed in enumerate(seeds, 1):
         seed_code = extract_code(seed)
-        frac_passed, results, coverage = test_suite(seed_code)
+        frac_passed, results = test_suite(seed_code)
         print(f"Seed {i} → passed {frac_passed*100:.1f}% of tests")
 
         fully_passed = frac_passed == 1.0
@@ -630,7 +630,8 @@ def run_self_repair_iterative(
         max_attempts=10,
         mode="critique+refine",
         use_coverage=False,
-        language="python"):
+        language="python",
+        precomputed_seeds=None):
     """
     Perform iterative self-repair with multiple independent seeds (np),
     refined in parallel using threads.
@@ -643,14 +644,20 @@ def run_self_repair_iterative(
     overall_success = False
     attempt_history = defaultdict(list)
 
-    # ---------- Stage 1: Generate seeds ----------
-    print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generating {np} initial seeds...", flush=True)
-    try:
-        seeds = model.generate(task_description=task, n=np, temperature=0.7, language=language)
-        print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generated {len(seeds)} seeds successfully.", flush=True)
-    except Exception as e:
-        print(f"[ERROR {time.strftime('%H:%M:%S')}] Seed generation failed: {e}", flush=True)
-        return {"task_id": task, "success": False, "trajectories": [], "k": 0}
+    # ---------- Stage 1: Generate or load seeds ----------
+    if precomputed_seeds:
+        seeds = precomputed_seeds
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] Using {len(seeds)} precomputed seeds.", flush=True)
+    else:
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generating {np} initial seeds...", flush=True)
+        try:
+            seeds = model.generate(task_description=task, n=np, temperature=0.7, language=language)
+            print(f"[DEBUG {time.strftime('%H:%M:%S')}] Generated {len(seeds)} seeds successfully.", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[ERROR {time.strftime('%H:%M:%S')}] Seed generation failed: {e}", flush=True)
+            traceback.print_exc()
+            return {"task_id": task, "success": False, "trajectories": [], "k": 0}
 
     def process_seed(i, seed):
         """Process one seed end-to-end."""
@@ -971,11 +978,15 @@ def extract_code(text: str) -> str:
         return text.strip()
 
 
-def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
+def make_mbpp_test_suite(setup_code: str, test_list: list[str], timeout_seconds=5):
     """
     Executes MBPP test cases and reports fractional correctness and detailed outcomes.
     Returns (fraction_passed, results_list).
+    Each test is run in a thread with a timeout to prevent infinite loops from hanging.
     """
+    def run_single_test(test, env):
+        exec(test, env)
+
     def test_suite(program_code: str):
         env = {}
         try:
@@ -990,18 +1001,23 @@ def make_mbpp_test_suite(setup_code: str, test_list: list[str]):
         passed, total = 0, len(test_list)
         results = []
 
-        # Execute each test independently
+        # Execute each test independently with a timeout
         for i, test in enumerate(test_list, 1):
-            try:
-                exec(test, env)
-                passed += 1
-                results.append((i, "✅ PASS", test))
-            except AssertionError as e:
-                results.append((i, "❌ FAIL", test))
-                print("DEBUG: ASSERTION FAILED:", e)
-            except Exception as e:
-                tb = traceback.format_exception_only(type(e), e)[0].strip()
-                results.append((i, f"⚠️ ERROR: {tb}", test))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_single_test, test, env)
+                try:
+                    future.result(timeout=timeout_seconds)
+                    passed += 1
+                    results.append((i, "✅ PASS", test))
+                except concurrent.futures.TimeoutError:
+                    results.append((i, f"TIMEOUT (> {timeout_seconds}s)", test))
+                    print(f"DEBUG: TEST TIMEOUT after {timeout_seconds}s")
+                except AssertionError as e:
+                    results.append((i, "❌ FAIL", test))
+                    print("DEBUG: ASSERTION FAILED:", e)
+                except Exception as e:
+                    tb = traceback.format_exception_only(type(e), e)[0].strip()
+                    results.append((i, f"⚠️ ERROR: {tb}", test))
 
         frac_passed = passed / total if total > 0 else 0.0
         return frac_passed, results
@@ -1333,8 +1349,34 @@ def main():
         "--start_task_id",
         type=int, default=None,
         help="Start running MBPP from this task_id onward.")
+    parser.add_argument(
+        "--load_seeds_from",
+        type=str, default=None,
+        help="Path to a previous run's JSONL file. Reuses its initial programs as seeds "
+             "instead of generating new ones, so h=0 and h=1 share identical starting points."
+    )
 
     args = parser.parse_args()
+
+    # ---------- Load precomputed seeds (optional) ----------
+    precomputed_seeds = {}  # task_id -> list of program strings
+    if args.load_seeds_from:
+        print(f"[INFO] Loading precomputed seeds from: {args.load_seeds_from}", flush=True)
+        with open(args.load_seeds_from, encoding="utf-8") as sf:
+            for line in sf:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                tid = entry.get("task_id")
+                programs = [
+                    traj["initial_program"]
+                    for traj in entry.get("trajectories", [])
+                    if traj and traj.get("initial_program")
+                ]
+                if tid and programs:
+                    precomputed_seeds[tid] = programs
+        print(f"[INFO] Loaded seeds for {len(precomputed_seeds)} tasks.", flush=True)
 
     model = Model(model_name=args.model_name, temperature=args.temperature)
 
@@ -1405,7 +1447,8 @@ def main():
                     test_suite=test_suite,
                     np=args.np,
                     max_attempts=args.max_attempts,
-                    mode=args.refine_mode
+                    mode=args.refine_mode,
+                    precomputed_seeds=precomputed_seeds.get(str(task_id))
                 )
             else:
                 result = run_self_repair(
@@ -1458,7 +1501,8 @@ def main():
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
                     task=desc, model=model, test_suite=test_suite,
-                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode
+                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode,
+                    precomputed_seeds=precomputed_seeds.get(str(task_id))
                 )
             else:
                 result = run_self_repair(
@@ -1490,7 +1534,8 @@ def main():
             if args.mode == "iterative":
                 result = run_self_repair_iterative(
                     task=prompt, model=model, test_suite=test_suite,
-                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode
+                    np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode,
+                    precomputed_seeds=precomputed_seeds.get(str(task_id))
                 )
             else:
                 result = run_self_repair(
@@ -1520,7 +1565,8 @@ def main():
                 result = run_self_repair_iterative(
                     task=prompt, model=model, test_suite=test_suite,
                     np=args.np, max_attempts=args.max_attempts, mode=args.refine_mode,
-                    language=args.language
+                    language=args.language,
+                    precomputed_seeds=precomputed_seeds.get(str(task_id))
                 )
             else:
                 result = run_self_repair(
@@ -1609,7 +1655,8 @@ def main():
                         test_suite=test_suite,
                         np=args.np,
                         max_attempts=args.max_attempts,
-                        mode=args.refine_mode
+                        mode=args.refine_mode,
+                        precomputed_seeds=precomputed_seeds.get(str(problem_id))
                     )
                 else:
                     result = run_self_repair(

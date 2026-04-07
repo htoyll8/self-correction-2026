@@ -201,7 +201,8 @@ class Model:
                 code = response.output_text
 
             # 🔧 NEW: sanitize Java output
-            # code = self._sanitize_java_output(code)
+            if language == "java":
+                code = self._sanitize_java_output(code)
 
             responses.append(code)
 
