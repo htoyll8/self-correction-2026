@@ -1,22 +1,38 @@
+import os
 import re
 import textwrap
 import anthropic
 from openai import OpenAI
+
+# Set ANTHROPIC_VERTEX_PROJECT to use Vertex AI instead of direct Anthropic API.
+# e.g. export ANTHROPIC_VERTEX_PROJECT=dafny-sketcher
+_VERTEX_PROJECT = os.environ.get("ANTHROPIC_VERTEX_PROJECT")
+_VERTEX_REGION  = os.environ.get("ANTHROPIC_VERTEX_REGION", "us-east5")
 
 
 class Model:
     def __init__(self,
                  model_name="gpt-4o-mini",
                  temperature=0):
-        self.client = OpenAI()
         self.model_name = model_name
         self.temperature = temperature
-        print(hasattr(self.client, "responses"))
 
         if self._is_claude():
-            self.client = anthropic.Anthropic()
+            vertex_project = os.environ.get("ANTHROPIC_VERTEX_PROJECT")
+            vertex_region = os.environ.get("ANTHROPIC_VERTEX_REGION", "us-east5")
+            if vertex_project:
+                from anthropic import AnthropicVertex
+                self.client = AnthropicVertex(
+                    project_id=vertex_project,
+                    region=vertex_region,
+                )
+                print(f"[INFO] Using Vertex AI for Claude (project={vertex_project}, region={vertex_region})")
+            else:
+                self.client = anthropic.Anthropic()
+                print("[INFO] Using direct Anthropic API for Claude")
         else:
             self.client = OpenAI()
+            print(hasattr(self.client, "responses"))
 
     def _is_claude(self):
         return self.model_name.lower().startswith("claude")
