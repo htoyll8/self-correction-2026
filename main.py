@@ -1547,7 +1547,7 @@ def main():
             write_result(result)
 
     elif args.dataset == "humaneval-x":
-        ds = load_dataset("THUDM/humaneval-x", args.language)["test"]
+        ds = load_dataset("THUDM/humaneval-x", args.language, trust_remote_code=True)["test"]
         selected = ds if args.task_ids is None else [ex for ex in ds if ex["task_id"] in args.task_ids]
         print(f"Loaded HumanEval-X ({args.language}) with {len(selected)} test tasks.")
 
