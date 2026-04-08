@@ -6,9 +6,9 @@ Run this on the GCP VM to create ~/run_experiments.sh
 """
 
 script = """#!/bin/bash
-set -e
 
 SESSION="exp1"
+tmux kill-session -t $SESSION 2>/dev/null || true
 tmux new-session -d -s $SESSION -n "mbpp-claude"
 
 tmux send-keys -t $SESSION:0 "cd ~/self-correction-2026 && export ANTHROPIC_VERTEX_PROJECT=dafny-sketcher && export ANTHROPIC_VERTEX_REGION=us-east5 && python3 main.py --dataset mbppplus --np 5 --max_attempts 10 --model_name claude-sonnet-4-5 --mode iterative --refine_mode critique+history+refine --max_tasks 100 > logs/claude_mbppplus_h0.log 2>&1" Enter
