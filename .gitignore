@@ -1,24 +1,46 @@
-__pycache__/
+# macOS
 .DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing & coverage
+.pytest_cache/
 .coverage
+htmlcov/
 
-# Results and logs
-results/
-logs/
-antiunify_logs/
-antiunify_logs_1/
-rq5_out/
-iteration_analysis_out/
+# Secrets / env
+.env
+.env.local
+.env.*.local
 
-# Dissertation (kept local)
-dissertation/
+# ML experiment tracking
+mlruns/
+wandb/
 
-# Output files
-*.png
-*.gexf
-notes.md
-
-# Misc
-CLAUDE.md
-.anthropic_api_key
-.openai_api_key
+# Research outputs (decide per project)
+# data/
+# results/
+# outputs/
+# *.jsonl
