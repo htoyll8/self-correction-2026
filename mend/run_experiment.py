@@ -159,35 +159,67 @@ def run_task(model: Model, desc: str, scorer: Callable[[str], float],
     return rows
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Self-correction rerun (canonical logging).")
     ap.add_argument("--model", default="gpt-4o-mini")
     ap.add_argument("--dataset", default="mbppplus")
     ap.add_argument("--n_tasks", type=int, default=8)
     ap.add_argument("--np", type=int, default=3)
     ap.add_argument("--max_attempts", type=int, default=5)
     ap.add_argument("--refine_mode", default="critique+refine")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def load_tasks(dataset: str, n_tasks: int) -> list[dict]:
+    """Load the first n_tasks of the benchmark as plain dicts."""
+    ds = load_dataset("evalplus/mbppplus")["test"]   # only mbppplus wired for the pilot
+    return list(ds)[:n_tasks]
+
+
+def build_desc(ex: dict) -> str:
+    """Task prompt augmented with the legacy MBPP function-name/arity hint."""
+    desc = ex["prompt"]
+    fname, pcount = extract_function_signature(ex["test_list"])
+    if fname:
+        desc += f"\nMAKE SURE THE FUNCTION IS NAMED `{fname}`."
+    if pcount is not None:
+        desc += f"\nTHE FUNCTION MUST TAKE EXACTLY {pcount} PARAMETER(S)."
+    return desc
+
+
+def write_rows(jf, rows: list[dict]) -> None:
+    """Append rows to the durable JSONL log and fsync (a crash keeps finished tasks)."""
+    for r in rows:
+        jf.write(json.dumps(r) + "\n")
+    jf.flush()
+    os.fsync(jf.fileno())
+
+
+def log_condition_metrics(m: dict) -> None:
+    """Log the (single-condition) headline scalars to the active MLflow run."""
+    mm = next(iter(m.values()), None)
+    if mm is None:
+        return
+    for key in ("initial_pass_rate", "recovered_of_failed", "recovered_of_all", "task_solve_rate"):
+        mlflow.log_metric(key, mm[key] or 0.0)
+    for rk, rv in mm["rounds"].items():
+        val = rv["mean_pass_fraction"] if isinstance(rv, dict) else rv
+        if val is not None:
+            mlflow.log_metric(rk, val)
+
+
+def main() -> None:
+    args = parse_args()
     sha = git_sha()
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + sha
     os.makedirs(DATA, exist_ok=True)
     model = Model(model_name=args.model)
-
-    ds = load_dataset("evalplus/mbppplus")["test"]
-    tasks = list(ds)[: args.n_tasks]
+    tasks = load_tasks(args.dataset, args.n_tasks)
     print(f"[INFO] run_id={run_id} model={args.model} tasks={len(tasks)} np={args.np} max_attempts={args.max_attempts}")
 
     mlflow.set_tracking_uri(MLRUNS)
     mlflow.set_experiment("self-correction-rerun")
     jsonl = os.path.join(DATA, f"results_{run_id}.jsonl")
-    jf = open(jsonl, "w", encoding="utf-8")
-
-    def write_rows(rows: list[dict]) -> None:
-        for r in rows:
-            jf.write(json.dumps(r) + "\n")
-        jf.flush()
-        os.fsync(jf.fileno())  # durable per task: a crash keeps completed tasks
 
     with mlflow.start_run(run_name=run_id):
         mlflow.log_params({
@@ -195,28 +227,22 @@ def main() -> None:
             "np": args.np, "max_attempts": args.max_attempts, "refine_mode": args.refine_mode,
             "n_tasks": len(tasks),
         })
-        for i, ex in enumerate(tasks, 1):
-            tests = ex["test_list"]
-            desc = ex["prompt"]
-            fname, pcount = extract_function_signature(tests)
-            if fname:
-                desc += f"\nMAKE SURE THE FUNCTION IS NAMED `{fname}`."
-            if pcount is not None:
-                desc += f"\nTHE FUNCTION MUST TAKE EXACTLY {pcount} PARAMETER(S)."
-            base = {
-                "run_id": run_id, "git_sha": sha, "dataset": args.dataset, "model": args.model,
-                "refine_mode": args.refine_mode, "difficulty": "na", "task_id": str(ex["task_id"]),
-                "n_tests": len(tests), "np": args.np, "max_attempts": args.max_attempts,
-            }
-            scorer = make_scorer(ex["test_imports"], tests)
-            t0 = time.time()
-            rows = run_task(model, desc, scorer, args.np, args.max_attempts, base)
-            write_rows(rows)
-            init_pass = sum(r["passed"] for r in rows if r["attempt"] == 0)
-            print(f"[{i}/{len(tasks)}] task {ex['task_id']}: {len(rows)} programs, "
-                  f"{init_pass}/{args.np} seeds passed initially ({time.time()-t0:.0f}s)")
+        with open(jsonl, "w", encoding="utf-8") as jf:
+            for i, ex in enumerate(tasks, 1):
+                tests = ex["test_list"]
+                base = {
+                    "run_id": run_id, "git_sha": sha, "dataset": args.dataset, "model": args.model,
+                    "refine_mode": args.refine_mode, "difficulty": "na", "task_id": str(ex["task_id"]),
+                    "n_tests": len(tests), "np": args.np, "max_attempts": args.max_attempts,
+                }
+                scorer = make_scorer(ex["test_imports"], tests)
+                t0 = time.time()
+                rows = run_task(model, build_desc(ex), scorer, args.np, args.max_attempts, base)
+                write_rows(jf, rows)
+                init_pass = sum(r["passed"] for r in rows if r["attempt"] == 0)
+                print(f"[{i}/{len(tasks)}] task {ex['task_id']}: {len(rows)} programs, "
+                      f"{init_pass}/{args.np} seeds passed initially ({time.time()-t0:.0f}s)")
 
-        jf.close()
         df = pd.read_json(jsonl, lines=True)
         df["task_id"] = df["task_id"].astype(str)
         pq = os.path.join(DATA, f"results_{run_id}.parquet")
@@ -232,16 +258,7 @@ def main() -> None:
         tex = os.path.join(DATA, f"summary_{run_id}.tex")
         metrics.latex_table(m, tex)
 
-        for cond, mm in m.items():
-            mlflow.log_metric("initial_pass_rate", mm["initial_pass_rate"] or 0.0)
-            mlflow.log_metric("recovered_of_failed", mm["recovered_of_failed"] or 0.0)
-            mlflow.log_metric("recovered_of_all", mm["recovered_of_all"] or 0.0)
-            mlflow.log_metric("task_solve_rate", mm["task_solve_rate"] or 0.0)
-            for rk, rv in mm["rounds"].items():
-                val = rv["mean_pass_fraction"] if isinstance(rv, dict) else rv
-                if val is not None:
-                    mlflow.log_metric(rk.replace("+", "_"), val)
-            break
+        log_condition_metrics(m)
         for p in (pq, mjson, fig, tex):
             mlflow.log_artifact(p)
 
