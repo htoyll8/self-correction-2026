@@ -18,7 +18,8 @@ CONDITION_COLS = ["dataset", "model", "refine_mode"]
 SEED_COLS = ["run_id", "task_id", "seed_idx"]
 
 
-def load(paths):
+def load(paths: str | list[str]) -> pd.DataFrame:
+    """Load one or more canonical result tables and assert no duplicate program rows."""
     if isinstance(paths, str):
         paths = [paths]
     df = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
@@ -27,7 +28,8 @@ def load(paths):
     return df
 
 
-def compute_condition(g):
+def compute_condition(g: pd.DataFrame) -> dict:
+    """Compute all locked metrics for a single condition group."""
     init = g[g.attempt == 0]
     failed = init[~init.passed]
     n_seeds, n_failed = len(init), len(failed)
@@ -56,7 +58,8 @@ def compute_condition(g):
     }
 
 
-def compute(df):
+def compute(df: pd.DataFrame) -> dict:
+    """Return {condition_string: metrics} grouped by (dataset, model, refine_mode)."""
     out = {}
     for keys, g in df.groupby(CONDITION_COLS):
         cond = " | ".join(map(str, keys if isinstance(keys, tuple) else (keys,)))
@@ -64,7 +67,7 @@ def compute(df):
     return out
 
 
-def figure(df, path):
+def figure(df: pd.DataFrame, path: str) -> None:
     """The headline curve: failed-only mean pass fraction vs refinement round."""
     plt.figure(figsize=(6.2, 4))
     for keys, g in df.groupby(CONDITION_COLS):
@@ -88,7 +91,8 @@ def figure(df, path):
     plt.close()
 
 
-def latex_table(metrics, path):
+def latex_table(metrics: dict, path: str) -> None:
+    """Write a small LaTeX summary table (one row per condition)."""
     def pct(x):
         return f"{x*100:.1f}\\%" if x is not None else "--"
     lines = [

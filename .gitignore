@@ -44,3 +44,4 @@ wandb/
 # results/
 # outputs/
 # *.jsonl
+data/
