@@ -1,8 +1,9 @@
-"""Isolated MBPP test worker. Reads {setup, program, tests, per_timeout} as JSON on
-stdin, executes setup+program once, then runs each assert with a per-assert SIGALRM
-timeout (so one infinite-loop test can't hang the rest and partial credit survives).
-Prints {"passed": int, "total": int}. Run in its own process group so the parent can
-SIGKILL the whole tree as a backstop.
+"""Isolated test worker (benchmark-agnostic). Reads {setup, program, prelude, tests,
+per_timeout} as JSON on stdin, executes setup+program (+optional prelude, e.g. binding
+`candidate` for HumanEval), then runs each assert with a per-assert SIGALRM timeout (so
+one infinite-loop test can't hang the rest and partial credit survives). Prints
+"##LCT##" + {"passed": int, "total": int}. Runs in its own process group so the parent
+can SIGKILL the whole tree as a backstop.
 """
 import json
 import signal
@@ -20,12 +21,15 @@ def _handler(signum, frame) -> None:
 def main() -> None:
     data = json.load(sys.stdin)
     setup, program, tests = data["setup"], data["program"], data["tests"]
+    prelude = data.get("prelude", "")  # runs after the program (e.g. bind `candidate`)
     per = int(data.get("per_timeout", 5))
 
     env = {}
     try:
         exec(setup or "", env)
         exec(program, env)
+        if prelude:
+            exec(prelude, env)
     except BaseException:  # incl. SystemExit from candidate code
         print("##LCT##" + json.dumps({"passed": 0, "total": len(tests)}))
         return

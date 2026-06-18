@@ -32,7 +32,7 @@ DATA = os.path.join(REPO, "data")
 MLFLOW_DB = "sqlite:///" + os.path.join(REPO, "mlflow.db")
 MLFLOW_ARTIFACTS = "file:" + os.path.join(REPO, "mlartifacts")
 MLFLOW_EXPERIMENT = "self-correction-rerun"
-WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mbpp_worker.py")
+WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_worker.py")
 
 WRAPPER_FUNCS = {"set", "sorted", "list", "tuple", "dict", "len", "max", "min", "sum",
                  "all", "any", "abs", "round", "int", "float", "str", "bool", "isclose"}
@@ -94,14 +94,15 @@ def extract_function_signature(assert_lines: list[str]) -> tuple[str | None, int
     return None, None
 
 
-def make_scorer(setup, tests: list[str], per_timeout: int = 5) -> Callable[[str], float]:
+def make_scorer(setup, tests: list[str], prelude: str = "", per_timeout: int = 5) -> Callable[[str], float]:
     """Score a program by running its asserts in an isolated, killable subprocess
-    (mend/mbpp_worker.py). Returns the fraction of tests passed."""
+    (mend/test_worker.py). `prelude` runs after the program (e.g. bind `candidate` for
+    HumanEval). Returns the fraction of tests passed."""
     setup_code = "\n".join(setup) if isinstance(setup, list) else (setup or "")
     tests = list(tests)
     if not tests:
         return lambda code: 0.0
-    base = {"setup": setup_code, "tests": tests, "per_timeout": per_timeout}
+    base = {"setup": setup_code, "prelude": prelude, "tests": tests, "per_timeout": per_timeout}
     overall = per_timeout * len(tests) + 15
 
     def score(code: str) -> float:
@@ -173,7 +174,7 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-DATASET_SOURCES = {"mbppplus": "evalplus/mbppplus"}
+DATASET_SOURCES = {"mbppplus": "evalplus/mbppplus", "humaneval": "openai/openai_humaneval"}
 
 
 def load_tasks(dataset: str, n_tasks: int) -> list[dict]:
@@ -197,6 +198,36 @@ def build_desc(ex: dict) -> str:
     if pcount is not None:
         desc += f"\nTHE FUNCTION MUST TAKE EXACTLY {pcount} PARAMETER(S)."
     return desc
+
+
+def extract_asserts(test_str: str) -> list[str]:
+    """Pull individual `assert` statements out of a HumanEval check() body so each can
+    be scored separately (partial credit), joining bracket/paren continuations."""
+    lines = [ln.rstrip() for ln in test_str.splitlines()]
+    asserts, i = [], 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("assert"):
+            stmt = lines[i].strip()
+            depth = stmt.count("(") - stmt.count(")") + stmt.count("[") - stmt.count("]")
+            while depth > 0 and i + 1 < len(lines):
+                i += 1
+                stmt += " " + lines[i].strip()
+                depth += lines[i].count("(") - lines[i].count(")") + lines[i].count("[") - lines[i].count("]")
+            asserts.append(stmt)
+        i += 1
+    return asserts
+
+
+def prepare_task(dataset: str, ex: dict) -> tuple[str, str, Callable[[str], float], int]:
+    """Return (task_id, desc, scorer, n_tests) for one benchmark example."""
+    if dataset == "mbppplus":
+        tests = ex["test_list"]
+        return str(ex["task_id"]), build_desc(ex), make_scorer(ex["test_imports"], tests), len(tests)
+    if dataset == "humaneval":
+        asserts = extract_asserts(ex["test"])
+        scorer = make_scorer("", asserts, prelude=f"candidate = {ex['entry_point']}")
+        return str(ex["task_id"]), ex["prompt"], scorer, len(asserts)
+    raise ValueError(f"unsupported dataset {dataset!r}")
 
 
 def write_rows(jf, rows: list[dict]) -> None:
@@ -252,15 +283,14 @@ def main() -> None:
         })
         with open(jsonl, "w", encoding="utf-8") as jf:
             for i, ex in enumerate(tasks, 1):
-                tests = ex["test_list"]
+                task_id, desc, scorer, n_tests = prepare_task(args.dataset, ex)
                 base = {
                     "run_id": run_id, "git_sha": sha, "dataset": args.dataset, "model": args.model,
-                    "refine_mode": args.refine_mode, "difficulty": "na", "task_id": str(ex["task_id"]),
-                    "n_tests": len(tests), "np": args.np, "max_attempts": args.max_attempts,
+                    "refine_mode": args.refine_mode, "difficulty": "na", "task_id": task_id,
+                    "n_tests": n_tests, "np": args.np, "max_attempts": args.max_attempts,
                 }
-                scorer = make_scorer(ex["test_imports"], tests)
                 t0 = time.time()
-                rows = run_task(model, build_desc(ex), scorer, args.np, args.max_attempts, base)
+                rows = run_task(model, desc, scorer, args.np, args.max_attempts, base)
                 write_rows(jf, rows)
                 init_pass = sum(r["passed"] for r in rows if r["attempt"] == 0)
                 print(f"[{i}/{len(tasks)}] task {ex['task_id']}: {len(rows)} programs, "
