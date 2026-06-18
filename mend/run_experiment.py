@@ -21,6 +21,7 @@ from datetime import datetime
 
 import pandas as pd
 import mlflow
+from mlflow.exceptions import MlflowException
 from datasets import load_dataset
 
 from mend import metrics
@@ -28,7 +29,9 @@ from mend.models.llm import Model
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(REPO, "data")
-MLRUNS = "file:" + os.path.join(REPO, "mlruns")
+MLFLOW_DB = "sqlite:///" + os.path.join(REPO, "mlflow.db")
+MLFLOW_ARTIFACTS = "file:" + os.path.join(REPO, "mlartifacts")
+MLFLOW_EXPERIMENT = "self-correction-rerun"
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mbpp_worker.py")
 
 WRAPPER_FUNCS = {"set", "sorted", "list", "tuple", "dict", "len", "max", "min", "sum",
@@ -162,7 +165,7 @@ def run_task(model: Model, desc: str, scorer: Callable[[str], float],
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Self-correction rerun (canonical logging).")
     ap.add_argument("--model", default="gpt-4o-mini")
-    ap.add_argument("--dataset", default="mbppplus")
+    ap.add_argument("--dataset", default="mbppplus", choices=sorted(DATASET_SOURCES))
     ap.add_argument("--n_tasks", type=int, default=8)
     ap.add_argument("--np", type=int, default=3)
     ap.add_argument("--max_attempts", type=int, default=5)
@@ -170,9 +173,18 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+DATASET_SOURCES = {"mbppplus": "evalplus/mbppplus"}
+
+
 def load_tasks(dataset: str, n_tasks: int) -> list[dict]:
-    """Load the first n_tasks of the benchmark as plain dicts."""
-    ds = load_dataset("evalplus/mbppplus")["test"]   # only mbppplus wired for the pilot
+    """Load the first n_tasks of the benchmark as plain dicts.
+
+    Only datasets in DATASET_SOURCES are wired; fail loudly rather than silently
+    running a different dataset than the one labeling the rows.
+    """
+    if dataset not in DATASET_SOURCES:
+        raise ValueError(f"dataset {dataset!r} not supported; choose from {sorted(DATASET_SOURCES)}")
+    ds = load_dataset(DATASET_SOURCES[dataset])["test"]
     return list(ds)[:n_tasks]
 
 
@@ -208,6 +220,18 @@ def log_condition_metrics(m: dict) -> None:
             mlflow.log_metric(rk, val)
 
 
+def setup_mlflow() -> None:
+    """Use a SQLite tracking backend (MLflow's recommended local store) with a
+    dedicated artifacts dir; create the experiment on first run."""
+    mlflow.set_tracking_uri(MLFLOW_DB)
+    try:  # EAFP: create once; swallow only "already exists", re-raise real errors
+        mlflow.create_experiment(MLFLOW_EXPERIMENT, artifact_location=MLFLOW_ARTIFACTS)
+    except MlflowException as e:
+        if "already exists" not in str(e).lower():
+            raise
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+
 def main() -> None:
     args = parse_args()
     sha = git_sha()
@@ -217,8 +241,7 @@ def main() -> None:
     tasks = load_tasks(args.dataset, args.n_tasks)
     print(f"[INFO] run_id={run_id} model={args.model} tasks={len(tasks)} np={args.np} max_attempts={args.max_attempts}")
 
-    mlflow.set_tracking_uri(MLRUNS)
-    mlflow.set_experiment("self-correction-rerun")
+    setup_mlflow()
     jsonl = os.path.join(DATA, f"results_{run_id}.jsonl")
 
     with mlflow.start_run(run_name=run_id):
