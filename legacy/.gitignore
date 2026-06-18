@@ -1,0 +1,24 @@
+__pycache__/
+.DS_Store
+.coverage
+
+# Results and logs
+results/
+logs/
+antiunify_logs/
+antiunify_logs_1/
+rq5_out/
+iteration_analysis_out/
+
+# Dissertation (kept local)
+dissertation/
+
+# Output files
+*.png
+*.gexf
+notes.md
+
+# Misc
+CLAUDE.md
+.anthropic_api_key
+.openai_api_key
