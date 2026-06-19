@@ -27,7 +27,7 @@ from mend.datasets.base import Task
 from mend.evaluators import make_scorer
 from mend.models.llm import Model
 from mend.utils import DATA, git_sha, make_run_id, write_rows
-from mend.utils.tracking import log_condition_metrics, setup_mlflow
+from mend.utils.tracking import log_condition_metrics, log_token_usage, setup_mlflow
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +108,11 @@ def main() -> None:
         log_condition_metrics(m)
         for p in artifacts:
             mlflow.log_artifact(p)
+
+        cost = log_token_usage(args.model, model.prompt_tokens, model.completion_tokens)
+        toks = model.prompt_tokens + model.completion_tokens
+        cost_str = f"~${cost:.2f}" if cost is not None else "cost: model not in price table"
+        print(f"[INFO] tokens: {model.prompt_tokens} in + {model.completion_tokens} out = {toks} ({cost_str})")
 
     print(f"\n[DONE] wrote {artifacts[0]}")
     print(json.dumps(m, indent=2))

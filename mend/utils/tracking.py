@@ -12,6 +12,16 @@ MLFLOW_DB = "sqlite:///" + os.path.join(REPO, "mlflow.db")
 MLFLOW_ARTIFACTS = "file:" + os.path.join(REPO, "mlartifacts")
 MLFLOW_EXPERIMENT = "self-correction-rerun"
 
+# USD per 1M tokens (input, output). Update if OpenAI/Anthropic pricing changes.
+PRICES = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4-turbo": (10.00, 30.00),
+    "gpt-4": (30.00, 60.00),
+    "gpt-4-0613": (30.00, 60.00),
+    "gpt-3.5-turbo": (0.50, 1.50),
+}
+
 
 def setup_mlflow() -> None:
     """Use a SQLite tracking backend (MLflow's recommended local store) with a dedicated
@@ -36,3 +46,24 @@ def log_condition_metrics(m: dict) -> None:
         val = rv["mean_pass_fraction"] if isinstance(rv, dict) else rv
         if val is not None:
             mlflow.log_metric(rk, val)
+
+
+def estimate_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> float | None:
+    """USD estimate from PRICES; None if the model isn't listed (log tokens but not cost)."""
+    price = PRICES.get(model_name)
+    if price is None:
+        return None
+    price_in, price_out = price
+    return prompt_tokens / 1e6 * price_in + completion_tokens / 1e6 * price_out
+
+
+def log_token_usage(model_name: str, prompt_tokens: int, completion_tokens: int) -> float | None:
+    """Log token totals (and a cost estimate if the model is priced) to the active run.
+    Returns the estimated USD cost, or None if the model isn't in PRICES."""
+    mlflow.log_metric("prompt_tokens", prompt_tokens)
+    mlflow.log_metric("completion_tokens", completion_tokens)
+    mlflow.log_metric("total_tokens", prompt_tokens + completion_tokens)
+    cost = estimate_cost(model_name, prompt_tokens, completion_tokens)
+    if cost is not None:
+        mlflow.log_metric("estimated_cost_usd", cost)
+    return cost
