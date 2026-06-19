@@ -1,9 +1,9 @@
 # Metric definitions (single source of truth)
 
-Every reported number is computed by `mend/metrics.py` from the canonical results table
+Every reported number is computed by `mend/analysis/metrics.py` from the canonical results table
 (`data/results_<run_id>.parquet`). Do not copy numbers from logs or recompute them by
 hand. To change a definition, edit it here and in `metrics.py`, then rerun
-`python -m mend.metrics <parquet>` to regenerate `metrics.json`, the tables, and the figures.
+`python -m mend.analysis.metrics <parquet>` to regenerate `metrics.json`, the tables, and the figures.
 
 ## Canonical table: one row per generated program
 
@@ -18,6 +18,8 @@ hand. To change a definition, edit it here and in `metrics.py`, then rerun
 | `pass_fraction` | fraction of the task's tests this program passes, in [0,1] |
 | `passed` | true when `pass_fraction == 1.0` |
 | `n_tests` | number of tests for the task |
+| `program` | full source of the program scored at this attempt |
+| `feedback` | critique that produced this program (null at attempt 0, the seed) |
 
 A seed trajectory is all rows sharing
 `(run_id, dataset, model, refine_mode, task_id, seed_idx)`, ordered by `attempt`.

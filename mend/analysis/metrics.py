@@ -3,7 +3,7 @@
 Reads one or more canonical per-run tables (data/results_<run_id>.parquet),
 concatenates them, and computes all metrics per condition (dataset, model,
 refine_mode). Definitions are locked in metrics_definitions.md — change them here
-and there only. Run:  python -m mend.metrics data/results_*.parquet
+and there only. Run:  python -m mend.analysis.metrics data/results_*.parquet
 """
 import json
 import sys

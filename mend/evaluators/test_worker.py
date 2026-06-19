@@ -1,9 +1,4 @@
-"""Isolated test worker (benchmark-agnostic). Reads {setup, program, prelude, tests,
-per_timeout} as JSON on stdin, executes setup+program (+optional prelude, e.g. binding
-`candidate` for HumanEval), then runs each assert with a per-assert SIGALRM timeout (so
-one infinite-loop test can't hang the rest and partial credit survives). Prints
-"##LCT##" + {"passed": int, "total": int}. Runs in its own process group so the parent
-can SIGKILL the whole tree as a backstop.
+"""Isolated test worker (benchmark-agnostic). Reads {setup, program, prelude, tests, per_timeout} as JSON on stdin, executes setup+program (+optional prelude, e.g. binding `candidate` for HumanEval), then runs each assert with a per-assert SIGALRM timeout (so one infinite-loop test can't hang the rest and partial credit survives). Prints "##LCT##" + {"passed": int, "total": int}. Runs in its own process group so the parent can SIGKILL the whole tree as a backstop.
 """
 import json
 import signal

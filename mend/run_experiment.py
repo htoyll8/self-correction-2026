@@ -1,321 +1,120 @@
-"""Self-correction rerun: iterative repair with one tidy row per generated program.
+"""Self-correction experiment orchestrator (thin entrypoint).
 
-Uses the legacy prompts/model interface (mend.models.llm.Model) so the rerun is
-methodologically identical to the original study. Writes the canonical table
-data/results_<run_id>.parquet (single source of truth for mend/metrics.py) and logs
-params/metrics/artifacts to a local MLflow store.
+Wires a dataset x model x strategy x evaluator into the canonical results table
+(data/results_<run_id>.parquet, the single source of truth for mend.analysis.metrics) and
+logs to a local MLflow store. The science lives in datasets/strategies/evaluators, results
+I/O in mend.analysis, and generic plumbing in mend.utils — this file only wires them.
 
-Pilot:  python -m mend.run_experiment --model gpt-4o-mini --dataset mbppplus \
-          --n_tasks 8 --np 3 --max_attempts 5
+Tasks run concurrently (--workers): the bottleneck is API latency + subprocess scoring, so
+threads overlap that I/O. The JSONL writer stays single-threaded (writes happen as futures
+complete) so logging is durable and lock-free.
+
+Pilot:  python -m mend.run_experiment --model gpt-4o-mini --dataset humaneval \
+          --n_tasks 6 --np 3 --max_attempts 5 --workers 8
 """
 import argparse
 import json
 import os
-import re
-import signal
-import subprocess
-import sys
 import time
-from collections.abc import Callable
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
 import mlflow
-from mlflow.exceptions import MlflowException
-from datasets import load_dataset
+from tqdm import tqdm
 
-from mend import metrics
+from mend import datasets, strategies
+from mend.analysis import results
+from mend.datasets.base import Task
+from mend.evaluators import make_scorer
 from mend.models.llm import Model
-
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA = os.path.join(REPO, "data")
-MLFLOW_DB = "sqlite:///" + os.path.join(REPO, "mlflow.db")
-MLFLOW_ARTIFACTS = "file:" + os.path.join(REPO, "mlartifacts")
-MLFLOW_EXPERIMENT = "self-correction-rerun"
-WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_worker.py")
-
-WRAPPER_FUNCS = {"set", "sorted", "list", "tuple", "dict", "len", "max", "min", "sum",
-                 "all", "any", "abs", "round", "int", "float", "str", "bool", "isclose"}
-
-
-def git_sha() -> str:
-    try:
-        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=REPO, text=True).strip()
-    except Exception:
-        return "nogit"
-
-
-def extract_code(text: str) -> str:
-    m = re.findall(r"```(?:\w+)?\n?(.*?)```", text or "", flags=re.DOTALL)
-    return (m[0] if m else (text or "")).strip()
-
-
-# --- legacy MBPP function-name/arity hint (ported from legacy/main.py) ---
-def _split_top_level_args(s: str) -> list[str]:
-    args, buf, depth = [], [], 0
-    for ch in s:
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        if ch == "," and depth == 0:
-            args.append("".join(buf).strip()); buf = []
-        else:
-            buf.append(ch)
-    if buf:
-        args.append("".join(buf).strip())
-    return args
-
-
-def extract_function_signature(assert_lines: list[str]) -> tuple[str | None, int | None]:
-    for line in assert_lines:
-        lhs = line.split("==")[0]
-        i, func_start = 0, None
-        while i < len(lhs):
-            ch = lhs[i]
-            if ch.isalpha() or ch == "_":
-                if func_start is None:
-                    func_start = i
-            else:
-                if func_start is not None:
-                    name = lhs[func_start:i]
-                    if i < len(lhs) and lhs[i] == "(":
-                        paren, j = 1, i + 1
-                        while j < len(lhs) and paren > 0:
-                            if lhs[j] == "(":
-                                paren += 1
-                            elif lhs[j] == ")":
-                                paren -= 1
-                            j += 1
-                        if paren == 0 and name not in WRAPPER_FUNCS:
-                            return name, len(_split_top_level_args(lhs[i + 1:j - 1]))
-                    func_start = None
-            i += 1
-    return None, None
-
-
-def make_scorer(setup, tests: list[str], prelude: str = "", per_timeout: int = 5) -> Callable[[str], float]:
-    """Score a program by running its asserts in an isolated, killable subprocess
-    (mend/test_worker.py). `prelude` runs after the program (e.g. bind `candidate` for
-    HumanEval). Returns the fraction of tests passed."""
-    setup_code = "\n".join(setup) if isinstance(setup, list) else (setup or "")
-    tests = list(tests)
-    if not tests:
-        return lambda code: 0.0
-    base = {"setup": setup_code, "prelude": prelude, "tests": tests, "per_timeout": per_timeout}
-    overall = per_timeout * len(tests) + 15
-
-    def score(code: str) -> float:
-        payload = json.dumps({**base, "program": code})
-        proc = subprocess.Popen(
-            [sys.executable, WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, preexec_fn=os.setsid,
-        )
-        try:
-            out, _ = proc.communicate(payload, timeout=overall)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # kill the whole tree
-            except Exception:
-                proc.kill()
-            return 0.0
-        for line in reversed(out.splitlines()):
-            if line.startswith("##LCT##"):
-                try:
-                    r = json.loads(line[len("##LCT##"):])
-                    return r["passed"] / r["total"] if r["total"] else 0.0
-                except Exception:
-                    return 0.0
-        return 0.0
-
-    return score
-
-
-def _row(base: dict, seed_idx: int, attempt: int, frac: float, passed: bool) -> dict:
-    return {
-        "run_id": base["run_id"], "git_sha": base["git_sha"], "dataset": base["dataset"],
-        "model": base["model"], "refine_mode": base["refine_mode"], "difficulty": base["difficulty"],
-        "task_id": base["task_id"], "seed_idx": seed_idx, "attempt": attempt,
-        "pass_fraction": float(frac), "passed": bool(passed), "n_tests": base["n_tests"],
-        "np": base["np"], "max_attempts": base["max_attempts"],
-    }
-
-
-def run_task(model: Model, desc: str, scorer: Callable[[str], float],
-             np_: int, max_attempts: int, base: dict) -> list[dict]:
-    rows = []
-    seeds = [extract_code(s) for s in model.generate(task_description=desc, n=np_, temperature=0.7)]
-    for si, seed in enumerate(seeds):
-        frac = scorer(seed)
-        passed = frac == 1.0
-        rows.append(_row(base, si, 0, frac, passed))
-        if passed:
-            continue
-        cur = seed
-        for k in range(1, max_attempts + 1):
-            feedback = model.generate_feedback(desc, cur, temperature=0)          # legacy critique
-            cur = extract_code(model.refine(desc, cur, feedback, temperature=0))   # legacy refine
-            frac = scorer(cur)
-            passed = frac == 1.0
-            rows.append(_row(base, si, k, frac, passed))
-            if passed:
-                break
-    return rows
+from mend.utils import DATA, git_sha, make_run_id, write_rows
+from mend.utils.tracking import log_condition_metrics, log_token_usage, setup_mlflow
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Self-correction rerun (canonical logging).")
+    ap = argparse.ArgumentParser(description="Self-correction experiment (canonical logging).")
     ap.add_argument("--model", default="gpt-4o-mini")
-    ap.add_argument("--dataset", default="mbppplus", choices=sorted(DATASET_SOURCES))
+    ap.add_argument("--dataset", default="mbppplus", choices=sorted(datasets.LOADERS))
     ap.add_argument("--n_tasks", type=int, default=8)
     ap.add_argument("--np", type=int, default=3)
     ap.add_argument("--max_attempts", type=int, default=5)
-    ap.add_argument("--refine_mode", default="critique+refine")
+    ap.add_argument("--refine_mode", default="critique+refine", choices=sorted(strategies.STRATEGIES))
+    ap.add_argument("--workers", type=int, default=8, help="tasks run concurrently (API I/O-bound)")
     return ap.parse_args()
 
 
-DATASET_SOURCES = {"mbppplus": "evalplus/mbppplus", "humaneval": "openai/openai_humaneval"}
-
-
-def load_tasks(dataset: str, n_tasks: int) -> list[dict]:
-    """Load the first n_tasks of the benchmark as plain dicts.
-
-    Only datasets in DATASET_SOURCES are wired; fail loudly rather than silently
-    running a different dataset than the one labeling the rows.
-    """
-    if dataset not in DATASET_SOURCES:
-        raise ValueError(f"dataset {dataset!r} not supported; choose from {sorted(DATASET_SOURCES)}")
-    ds = load_dataset(DATASET_SOURCES[dataset])["test"]
-    return list(ds)[:n_tasks]
-
-
-def build_desc(ex: dict) -> str:
-    """Task prompt augmented with the legacy MBPP function-name/arity hint."""
-    desc = ex["prompt"]
-    fname, pcount = extract_function_signature(ex["test_list"])
-    if fname:
-        desc += f"\nMAKE SURE THE FUNCTION IS NAMED `{fname}`."
-    if pcount is not None:
-        desc += f"\nTHE FUNCTION MUST TAKE EXACTLY {pcount} PARAMETER(S)."
-    return desc
-
-
-def extract_asserts(test_str: str) -> list[str]:
-    """Pull individual `assert` statements out of a HumanEval check() body so each can
-    be scored separately (partial credit), joining bracket/paren continuations."""
-    lines = [ln.rstrip() for ln in test_str.splitlines()]
-    asserts, i = [], 0
-    while i < len(lines):
-        if lines[i].lstrip().startswith("assert"):
-            stmt = lines[i].strip()
-            depth = stmt.count("(") - stmt.count(")") + stmt.count("[") - stmt.count("]")
-            while depth > 0 and i + 1 < len(lines):
-                i += 1
-                stmt += " " + lines[i].strip()
-                depth += lines[i].count("(") - lines[i].count(")") + lines[i].count("[") - lines[i].count("]")
-            asserts.append(stmt)
-        i += 1
-    return asserts
-
-
-def prepare_task(dataset: str, ex: dict) -> tuple[str, str, Callable[[str], float], int]:
-    """Return (task_id, desc, scorer, n_tests) for one benchmark example."""
-    if dataset == "mbppplus":
-        tests = ex["test_list"]
-        return str(ex["task_id"]), build_desc(ex), make_scorer(ex["test_imports"], tests), len(tests)
-    if dataset == "humaneval":
-        asserts = extract_asserts(ex["test"])
-        scorer = make_scorer("", asserts, prelude=f"candidate = {ex['entry_point']}")
-        return str(ex["task_id"]), ex["prompt"], scorer, len(asserts)
-    raise ValueError(f"unsupported dataset {dataset!r}")
-
-
-def write_rows(jf, rows: list[dict]) -> None:
-    """Append rows to the durable JSONL log and fsync (a crash keeps finished tasks)."""
-    for r in rows:
-        jf.write(json.dumps(r) + "\n")
-    jf.flush()
-    os.fsync(jf.fileno())
-
-
-def log_condition_metrics(m: dict) -> None:
-    """Log the (single-condition) headline scalars to the active MLflow run."""
-    mm = next(iter(m.values()), None)
-    if mm is None:
-        return
-    for key in ("initial_pass_rate", "recovered_of_failed", "recovered_of_all", "task_solve_rate"):
-        mlflow.log_metric(key, mm[key] or 0.0)
-    for rk, rv in mm["rounds"].items():
-        val = rv["mean_pass_fraction"] if isinstance(rv, dict) else rv
-        if val is not None:
-            mlflow.log_metric(rk, val)
-
-
-def setup_mlflow() -> None:
-    """Use a SQLite tracking backend (MLflow's recommended local store) with a
-    dedicated artifacts dir; create the experiment on first run."""
-    mlflow.set_tracking_uri(MLFLOW_DB)
-    try:  # EAFP: create once; swallow only "already exists", re-raise real errors
-        mlflow.create_experiment(MLFLOW_EXPERIMENT, artifact_location=MLFLOW_ARTIFACTS)
-    except MlflowException as e:
-        if "already exists" not in str(e).lower():
-            raise
-    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+def run_one_task(model: Model, strategy, task: Task, base_template: dict,
+                 np_: int, max_attempts: int) -> list[dict]:
+    """Run one task end-to-end (seeds + refinement) and return its canonical rows."""
+    scorer = make_scorer(task.setup, task.tests, prelude=task.prelude, per_timeout=task.per_timeout)
+    base = {**base_template, "task_id": task.task_id, "n_tests": task.n_tests}
+    attempts = strategy(model, task.description, scorer, np_, max_attempts)
+    return [results.to_row(base, a) for a in attempts]
 
 
 def main() -> None:
     args = parse_args()
     sha = git_sha()
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + sha
+    run_id = make_run_id(sha)
     os.makedirs(DATA, exist_ok=True)
+
     model = Model(model_name=args.model)
-    tasks = load_tasks(args.dataset, args.n_tasks)
-    print(f"[INFO] run_id={run_id} model={args.model} tasks={len(tasks)} np={args.np} max_attempts={args.max_attempts}")
+    tasks = datasets.load_tasks(args.dataset, args.n_tasks)
+    strategy = strategies.get_strategy(args.refine_mode)
+    print(f"[INFO] run_id={run_id} model={args.model} dataset={args.dataset} tasks={len(tasks)} "
+          f"np={args.np} max_attempts={args.max_attempts} mode={args.refine_mode} workers={args.workers}")
 
     setup_mlflow()
     jsonl = os.path.join(DATA, f"results_{run_id}.jsonl")
+    base_template = {
+        "run_id": run_id, "git_sha": sha, "dataset": args.dataset, "model": args.model,
+        "refine_mode": args.refine_mode, "difficulty": "na",
+        "np": args.np, "max_attempts": args.max_attempts,
+    }
 
     with mlflow.start_run(run_name=run_id):
         mlflow.log_params({
             "run_id": run_id, "git_sha": sha, "model": args.model, "dataset": args.dataset,
             "np": args.np, "max_attempts": args.max_attempts, "refine_mode": args.refine_mode,
-            "n_tasks": len(tasks),
+            "n_tasks": len(tasks), "workers": args.workers,
         })
+        t0 = time.time()
+        failed: list[str] = []
+        seeds_ok = 0
         with open(jsonl, "w", encoding="utf-8") as jf:
-            for i, ex in enumerate(tasks, 1):
-                task_id, desc, scorer, n_tests = prepare_task(args.dataset, ex)
-                base = {
-                    "run_id": run_id, "git_sha": sha, "dataset": args.dataset, "model": args.model,
-                    "refine_mode": args.refine_mode, "difficulty": "na", "task_id": task_id,
-                    "n_tests": n_tests, "np": args.np, "max_attempts": args.max_attempts,
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futures = {
+                    ex.submit(run_one_task, model, strategy, task, base_template, args.np, args.max_attempts): task
+                    for task in tasks
                 }
-                t0 = time.time()
-                rows = run_task(model, desc, scorer, args.np, args.max_attempts, base)
-                write_rows(jf, rows)
-                init_pass = sum(r["passed"] for r in rows if r["attempt"] == 0)
-                print(f"[{i}/{len(tasks)}] task {ex['task_id']}: {len(rows)} programs, "
-                      f"{init_pass}/{args.np} seeds passed initially ({time.time()-t0:.0f}s)")
+                bar = tqdm(as_completed(futures), total=len(tasks), unit="task",
+                           desc=f"{args.model} {args.dataset}", disable=None)
+                for fut in bar:
+                    task = futures[fut]
+                    try:
+                        rows = fut.result()
+                    except Exception as e:  # don't let one task sink a multi-hour run
+                        failed.append(task.task_id)
+                        bar.write(f"task {task.task_id}: FAILED ({type(e).__name__}: {e})")
+                        continue
+                    write_rows(jf, rows)  # single-threaded writer: durable, lock-free
+                    seeds_ok += sum(1 for r in rows if r["attempt"] == 0 and r["passed"])
+                    bar.set_postfix(seeds_ok=seeds_ok, failed=len(failed))
+        print(f"[INFO] all tasks done in {time.time()-t0:.0f}s")
+        mlflow.log_metric("tasks_failed", len(failed))
+        if failed:
+            print(f"[WARN] {len(failed)} task(s) failed and are NOT in the table: {', '.join(failed)}")
 
-        df = pd.read_json(jsonl, lines=True)
-        df["task_id"] = df["task_id"].astype(str)
-        pq = os.path.join(DATA, f"results_{run_id}.parquet")
-        df.to_parquet(pq)
-        df.to_csv(pq.replace(".parquet", ".csv"), index=False)
-
-        m = metrics.compute(df)
-        mjson = os.path.join(DATA, f"metrics_{run_id}.json")
-        with open(mjson, "w") as f:
-            json.dump(m, f, indent=2)
-        fig = os.path.join(DATA, f"curve_{run_id}.png")
-        metrics.figure(df, fig)
-        tex = os.path.join(DATA, f"summary_{run_id}.tex")
-        metrics.latex_table(m, tex)
-
+        m, artifacts = results.finalize(jsonl, run_id)
         log_condition_metrics(m)
-        for p in (pq, mjson, fig, tex):
+        for p in artifacts:
             mlflow.log_artifact(p)
 
-    print(f"\n[DONE] wrote {pq}")
+        cost = log_token_usage(args.model, model.prompt_tokens, model.completion_tokens)
+        toks = model.prompt_tokens + model.completion_tokens
+        cost_str = f"~${cost:.2f}" if cost is not None else "cost: model not in price table"
+        print(f"[INFO] tokens: {model.prompt_tokens} in + {model.completion_tokens} out = {toks} ({cost_str})")
+
+    print(f"\n[DONE] wrote {artifacts[0]}")
     print(json.dumps(m, indent=2))
 
 
