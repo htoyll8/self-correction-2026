@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
 def run_one_task(model: Model, strategy, task: Task, base_template: dict,
                  np_: int, max_attempts: int) -> list[dict]:
     """Run one task end-to-end (seeds + refinement) and return its canonical rows."""
-    scorer = make_scorer(task.setup, task.tests, prelude=task.prelude)
+    scorer = make_scorer(task.setup, task.tests, prelude=task.prelude, per_timeout=task.per_timeout)
     base = {**base_template, "task_id": task.task_id, "n_tests": task.n_tests}
     attempts = strategy(model, task.description, scorer, np_, max_attempts)
     return [results.to_row(base, a) for a in attempts]

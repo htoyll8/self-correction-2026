@@ -1,11 +1,18 @@
 """
 MBPP+ loader (evalplus/mbppplus).
 
-Ports the legacy function-name/arity hint: MBPP prompts don't name the function, so we infer it from the asserts and append a hint, exactly as the original study did.
+MBPP prompts don't name the function, so we infer it from the asserts and append a name/arity hint to the prompt.
 """
+import re
+
 from mend.datasets.base import Task, take
 
 SOURCE = "evalplus/mbppplus"
+PLUS_TIMEOUT = 30   # seconds for the whole-harness fallback (runs every case at once)
+
+# The standard EvalPlus MBPP+ harness ends with this loop over (inputs, results).
+_LOOP_RE = re.compile(r"for i, \(inp, exp\) in enumerate\(zip\(inputs, results\)\):")
+_ASSERT_RE = re.compile(r"assertion\((\w+)\(\*inp\), exp, ([^\)]+)\)")
 
 # builtins that can appear on the LHS of an assert but are not the task's function
 WRAPPER_FUNCS = frozenset({"set", "sorted", "list", "tuple", "dict", "len", "max",
@@ -67,15 +74,51 @@ def _build_desc(ex: dict) -> str:
     return desc
 
 
+def _split_harness(test_src: str) -> tuple[str, list[str]] | None:
+    """Split the EvalPlus `test` harness into (preamble, per-case test statements).
+
+    The preamble defines `assertion`, `inputs`, `results`; each returned statement re-runs
+    one case so the task is scored for partial credit. Returns None when the harness doesn't
+    match the standard loop (caller falls back to whole-harness, all-or-nothing scoring).
+    """
+    m_loop = _LOOP_RE.search(test_src)
+    m_assert = _ASSERT_RE.search(test_src)
+    if not (m_loop and m_assert):
+        return None
+    preamble = test_src[:m_loop.start()]
+    fname, atol = m_assert.group(1), m_assert.group(2)
+    env: dict = {}
+    try:  # run the preamble once to learn the case count
+        exec(preamble, env)
+        n = min(len(env["inputs"]), len(env["results"]))
+    except Exception:
+        return None
+    tests = [f"assertion({fname}(*inputs[{i}]), results[{i}], {atol})" for i in range(n)]
+    return preamble, tests
+
+
 def load(n_tasks: int) -> list[Task]:
+    """Load MBPP+ tasks scored against the full EvalPlus `test` harness.
+
+    `test` is the augmented "plus" suite (the point of MBPP+), not the 3-assert base MBPP
+    `test_list`. Where the harness matches the standard EvalPlus loop it is split into one
+    test per case (partial credit); the few non-standard harnesses fall back to running the
+    whole harness as a single all-or-nothing unit with a longer timeout.
+
+    The harness preamble is run as `prelude` (after the candidate) so its `inputs`/`results`/
+    `assertion` always win over any same-named variables the candidate happens to define.
+    """
     tasks = []
     for ex in take(SOURCE, n_tasks):
         imports = ex["test_imports"]
         setup = "\n".join(imports) if isinstance(imports, list) else (imports or "")
-        tasks.append(Task(
-            task_id=str(ex["task_id"]),
-            description=_build_desc(ex),
-            setup=setup,
-            tests=list(ex["test_list"]),
-        ))
+        desc = _build_desc(ex)   # name/arity hint still drawn from test_list
+        split = _split_harness(ex["test"])
+        if split is not None:
+            preamble, tests = split
+            tasks.append(Task(task_id=str(ex["task_id"]), description=desc,
+                              setup=setup, tests=tests, prelude=preamble))
+        else:
+            tasks.append(Task(task_id=str(ex["task_id"]), description=desc,
+                              setup=setup, tests=[ex["test"]], per_timeout=PLUS_TIMEOUT))
     return tasks

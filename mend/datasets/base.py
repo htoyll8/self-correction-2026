@@ -13,8 +13,9 @@ class Task:
     task_id: str
     description: str          # the natural-language prompt shown to the model
     setup: str               # code executed before the candidate program
-    tests: list[str]         # individual assert statements (scored for partial credit)
+    tests: list[str]         # test units, each scored separately (=> partial credit)
     prelude: str = ""        # code executed after the program (e.g. bind `candidate`)
+    per_timeout: int = 5     # seconds allowed per test unit (raise for whole-harness tests)
 
     @property
     def n_tests(self) -> int:
