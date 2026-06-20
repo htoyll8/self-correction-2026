@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max_attempts", type=int, default=5)
     ap.add_argument("--refine_mode", default="critique+refine", choices=sorted(strategies.STRATEGIES))
     ap.add_argument("--workers", type=int, default=8, help="tasks run concurrently (API I/O-bound)")
+    ap.add_argument("--task_ids", default="", help="comma-separated task ids to run (default: first --n_tasks)")
     return ap.parse_args()
 
 
@@ -58,7 +59,14 @@ def main() -> None:
     os.makedirs(DATA, exist_ok=True)
 
     model = Model(model_name=args.model)
-    tasks = datasets.load_tasks(args.dataset, args.n_tasks)
+    # task_ids overrides n_tasks: load all (take() caps at the dataset size) then filter.
+    tasks = datasets.load_tasks(args.dataset, 10**9 if args.task_ids else args.n_tasks)
+    if args.task_ids:
+        wanted = {s.strip() for s in args.task_ids.split(",") if s.strip()}
+        tasks = [t for t in tasks if t.task_id in wanted]
+        missing = wanted - {t.task_id for t in tasks}
+        if missing:
+            print(f"[WARN] requested task_ids not found in {args.dataset}: {sorted(missing)}")
     strategy = strategies.get_strategy(args.refine_mode)
     print(f"[INFO] run_id={run_id} model={args.model} dataset={args.dataset} tasks={len(tasks)} "
           f"np={args.np} max_attempts={args.max_attempts} mode={args.refine_mode} workers={args.workers}")
