@@ -13,6 +13,12 @@ from collections.abc import Callable
 
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_worker.py")
 
+# Hard wall-clock ceiling per scorer call, independent of test count. Without it, a
+# candidate that hangs on every one of N cases burns per_timeout*N seconds (many minutes
+# for MBPP+'s ~150-case harnesses). Set generously (5 min) so a slow-but-correct solution
+# is never falsely failed; it only fires on genuinely stuck candidates.
+MAX_WALL_SECONDS = 300
+
 
 def make_scorer(setup: str, tests: list[str], prelude: str = "", per_timeout: int = 5) -> Callable[[str], float]:
     """Build a scorer for one task. `prelude` runs after the program (e.g. bind `candidate`
@@ -21,7 +27,7 @@ def make_scorer(setup: str, tests: list[str], prelude: str = "", per_timeout: in
     if not tests:
         return lambda code: 0.0
     base = {"setup": setup or "", "prelude": prelude, "tests": tests, "per_timeout": per_timeout}
-    overall = per_timeout * len(tests) + 15
+    overall = min(per_timeout * len(tests) + 15, MAX_WALL_SECONDS)
 
     def score(code: str) -> float:
         payload = json.dumps({**base, "program": code})

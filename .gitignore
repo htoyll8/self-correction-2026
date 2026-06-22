@@ -45,5 +45,5 @@ wandb/
 # outputs/
 # *.jsonl
 data/
-mlflow.db
+mlflow*.db
 mlartifacts/

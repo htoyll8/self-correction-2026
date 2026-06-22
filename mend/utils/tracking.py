@@ -8,8 +8,20 @@ from mlflow.exceptions import MlflowException
 
 from mend.utils import REPO
 
-MLFLOW_DB = "sqlite:///" + os.path.join(REPO, "mlflow.db")
-MLFLOW_ARTIFACTS = "file:" + os.path.join(REPO, "mlartifacts")
+def _uri(env_key: str, default: str, scheme: str) -> str:
+    """Resolve a tracking URI from an env override. A value with a scheme (e.g.
+    sqlite:///x or file:x) is used as-is; a bare path is turned into an absolute one with
+    `scheme` prepended, so callers can pass just `mlflow_4o.db`."""
+    val = os.environ.get(env_key)
+    if not val:
+        return default
+    return val if "://" in val else scheme + os.path.abspath(val)
+
+
+# Overridable so concurrent runs can each use their own SQLite db (one shared db is the
+# only write-contention point between parallel runs; the per-run data/ files never collide).
+MLFLOW_DB = _uri("MEND_MLFLOW_DB", "sqlite:///" + os.path.join(REPO, "mlflow.db"), "sqlite:///")
+MLFLOW_ARTIFACTS = _uri("MEND_MLFLOW_ARTIFACTS", "file:" + os.path.join(REPO, "mlartifacts"), "file:")
 MLFLOW_EXPERIMENT = "self-correction-rerun"
 
 # USD per 1M tokens (input, output). Update if OpenAI/Anthropic pricing changes.
