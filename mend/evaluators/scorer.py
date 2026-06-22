@@ -20,14 +20,24 @@ WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_worker.p
 MAX_WALL_SECONDS = 300
 
 
-def make_scorer(setup: str, tests: list[str], prelude: str = "", per_timeout: int = 5) -> Callable[[str], float]:
+def make_scorer(setup: str, tests: list, prelude: str = "", per_timeout: int = 5,
+                io_mode: str = "function") -> Callable[[str], float]:
     """Build a scorer for one task. `prelude` runs after the program (e.g. bind `candidate`
-    for HumanEval). The returned callable scores a candidate program string in [0, 1]."""
+    for HumanEval). `io_mode` is "function" (assert-based tests) or "stdio" ([input, output]
+    pairs run via piped stdin). The returned callable scores a candidate program in [0, 1]."""
     tests = list(tests)
     if not tests:
         return lambda code: 0.0
-    base = {"setup": setup or "", "prelude": prelude, "tests": tests, "per_timeout": per_timeout}
     overall = min(per_timeout * len(tests) + 15, MAX_WALL_SECONDS)
+    # The worker stops at `budget` and prints its partial progress, so hitting the wall cap
+    # yields partial credit instead of the 0.0 we'd get if the parent SIGKILLed it before it
+    # emitted the sentinel. The margin must exceed one per_timeout: budget is only checked
+    # between cases, so a case started just under budget can run a full per_timeout longer and
+    # must still finish before the parent's `overall` kill.
+    margin = per_timeout + 3
+    budget = max(overall - margin, per_timeout)
+    base = {"setup": setup or "", "prelude": prelude, "tests": tests,
+            "per_timeout": per_timeout, "io_mode": io_mode, "budget": budget}
 
     def score(code: str) -> float:
         payload = json.dumps({**base, "program": code})
