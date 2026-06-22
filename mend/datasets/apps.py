@@ -58,12 +58,15 @@ def _call_tests(io: dict) -> tuple[str, list[str]]:
 
 
 def load(n_tasks: int, difficulties: tuple[str, ...] | None = None) -> list[Task]:
-    """Load APPS tasks. `n_tasks` is a scan bound (rows read), not a guaranteed result count:
-    problems with no tests, and (if `difficulties` is given) other tiers, are skipped.
-    `difficulties` filters to a subset of {introductory, interview, competition}."""
+    """Return up to `n_tasks` APPS tasks, scanning the split in order until that many are
+    collected (the split is ordered interview-first, so reaching introductory/competition
+    means scanning past the interview block). `difficulties` filters to a subset of
+    {introductory, interview, competition}; problems with no tests are skipped."""
     tasks: list[Task] = []
     skipped_no_tests = 0
-    for ex in take(SOURCE, n_tasks):
+    for ex in take(SOURCE, 10**9):  # whole split, lazily; we stop once we have n_tasks
+        if len(tasks) >= n_tasks:
+            break
         if difficulties and ex["difficulty"] not in difficulties:
             continue
         raw = ex["input_output"]

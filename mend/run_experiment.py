@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--refine_mode", default="critique+refine", choices=sorted(strategies.STRATEGIES))
     ap.add_argument("--workers", type=int, default=8, help="tasks run concurrently (API I/O-bound)")
     ap.add_argument("--task_ids", default="", help="comma-separated task ids to run (default: first --n_tasks)")
+    ap.add_argument("--difficulties", default="",
+                    help="comma-separated APPS tiers to keep (introductory,interview,competition)")
     return ap.parse_args()
 
 
@@ -61,8 +63,10 @@ def main() -> None:
     os.makedirs(DATA, exist_ok=True)
 
     model = Model(model_name=args.model)
+    difficulties = tuple(s.strip() for s in args.difficulties.split(",") if s.strip()) or None
     # task_ids overrides n_tasks: load all (take() caps at the dataset size) then filter.
-    tasks = datasets.load_tasks(args.dataset, 10**9 if args.task_ids else args.n_tasks)
+    tasks = datasets.load_tasks(args.dataset, 10**9 if args.task_ids else args.n_tasks,
+                                difficulties=difficulties)
     if args.task_ids:
         wanted = {s.strip() for s in args.task_ids.split(",") if s.strip()}
         tasks = [t for t in tasks if t.task_id in wanted]
