@@ -70,7 +70,9 @@ def _run_stdio(setup: str, program: str, tests: list, per: int, budget: float | 
         stdin_text, expected = case[0], case[1]
         saved_in, saved_out = sys.stdin, sys.stdout
         sys.stdin, sys.stdout = io.StringIO(stdin_text), io.StringIO()
-        env: dict = {}
+        # __name__ == "__main__" so a solution guarded by `if __name__ == "__main__":`
+        # actually runs its driver (common for stdin scripts); without this it scores 0.
+        env: dict = {"__name__": "__main__"}
         try:
             signal.alarm(per)
             exec(setup or "", env)
