@@ -4,11 +4,12 @@ Add a benchmark by writing a loader module that exposes `load(n_tasks) -> list[T
 and registering it in LOADERS below. Nothing else in the framework needs to change.
 """
 from mend.datasets.base import Task
-from mend.datasets import mbppplus, humaneval
+from mend.datasets import mbppplus, humaneval, apps
 
 LOADERS = {
     "mbppplus": mbppplus.load,
     "humaneval": humaneval.load,
+    "apps": apps.load,
 }
 
 

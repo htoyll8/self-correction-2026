@@ -46,8 +46,10 @@ def parse_args() -> argparse.Namespace:
 def run_one_task(model: Model, strategy, task: Task, base_template: dict,
                  np_: int, max_attempts: int) -> list[dict]:
     """Run one task end-to-end (seeds + refinement) and return its canonical rows."""
-    scorer = make_scorer(task.setup, task.tests, prelude=task.prelude, per_timeout=task.per_timeout)
-    base = {**base_template, "task_id": task.task_id, "n_tests": task.n_tests}
+    scorer = make_scorer(task.setup, task.tests, prelude=task.prelude,
+                         per_timeout=task.per_timeout, io_mode=task.io_mode)
+    base = {**base_template, "task_id": task.task_id, "n_tests": task.n_tests,
+            "difficulty": task.difficulty}
     attempts = strategy(model, task.description, scorer, np_, max_attempts)
     return [results.to_row(base, a) for a in attempts]
 
@@ -73,9 +75,9 @@ def main() -> None:
 
     setup_mlflow()
     jsonl = os.path.join(DATA, f"results_{run_id}.jsonl")
-    base_template = {
+    base_template = {  # difficulty is filled per-task in run_one_task
         "run_id": run_id, "git_sha": sha, "dataset": args.dataset, "model": args.model,
-        "refine_mode": args.refine_mode, "difficulty": "na",
+        "refine_mode": args.refine_mode,
         "np": args.np, "max_attempts": args.max_attempts,
     }
 

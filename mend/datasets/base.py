@@ -13,9 +13,12 @@ class Task:
     task_id: str
     description: str          # the natural-language prompt shown to the model
     setup: str               # code executed before the candidate program
-    tests: list[str]         # test units, each scored separately (=> partial credit)
+    tests: list              # test units, each scored separately (=> partial credit).
+                             # function mode: assert strings; stdio mode: [input, output] pairs
     prelude: str = ""        # code executed after the program (e.g. bind `candidate`)
     per_timeout: int = 5     # seconds allowed per test unit (raise for whole-harness tests)
+    io_mode: str = "function"  # "function" (assert-based) or "stdio" (piped stdin/stdout)
+    difficulty: str = "na"   # benchmark difficulty tier, when the dataset provides one
 
     @property
     def n_tests(self) -> int:
