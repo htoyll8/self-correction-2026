@@ -37,7 +37,8 @@ def _over_budget(start: float, budget: float | None) -> bool:
 
 
 def _run_function(setup: str, program: str, prelude: str, tests: list, per: int,
-                  budget: float | None) -> int:
+                  budget: float | None) -> list[bool]:
+    """Per-case pass list (length len(tests)); cases left unrun by the budget are False."""
     env: dict = {}
     try:
         exec(setup or "", env)
@@ -45,28 +46,29 @@ def _run_function(setup: str, program: str, prelude: str, tests: list, per: int,
         if prelude:
             exec(prelude, env)
     except BaseException:  # incl. SystemExit from candidate code
-        return 0
-    start, passed = time.monotonic(), 0
+        return [False] * len(tests)
+    start, cases = time.monotonic(), []
     for t in tests:
         if _over_budget(start, budget):
-            break  # remaining tests count as not-passed (total stays len(tests))
+            break  # remaining cases stay False (padded below)
         try:
             signal.alarm(per)
             exec(t, env)
-            passed += 1
+            cases.append(True)
         except BaseException:  # _Timeout, AssertionError, SystemExit, etc.
-            pass
+            cases.append(False)
         finally:
             signal.alarm(0)
-    return passed
+    return cases + [False] * (len(tests) - len(cases))
 
 
-def _run_stdio(setup: str, program: str, tests: list, per: int, budget: float | None) -> int:
-    """Run the program once per case with piped stdin; count cases whose stdout matches."""
-    start, passed = time.monotonic(), 0
+def _run_stdio(setup: str, program: str, tests: list, per: int, budget: float | None) -> list[bool]:
+    """Run the program once per case with piped stdin; per-case True when stdout matches.
+    Cases left unrun by the budget stay False."""
+    start, cases = time.monotonic(), []
     for case in tests:
         if _over_budget(start, budget):
-            break  # remaining cases count as not-passed (total stays len(tests))
+            break  # remaining cases stay False (padded below)
         stdin_text, expected = case[0], case[1]
         saved_in, saved_out = sys.stdin, sys.stdout
         sys.stdin, sys.stdout = io.StringIO(stdin_text), io.StringIO()
@@ -83,9 +85,8 @@ def _run_stdio(setup: str, program: str, tests: list, per: int, budget: float | 
         finally:
             signal.alarm(0)
             sys.stdin, sys.stdout = saved_in, saved_out
-        if got is not None and _normalize(got) == _normalize(expected):
-            passed += 1
-    return passed
+        cases.append(got is not None and _normalize(got) == _normalize(expected))
+    return cases + [False] * (len(tests) - len(cases))
 
 
 def main() -> None:
@@ -98,12 +99,13 @@ def main() -> None:
 
     signal.signal(signal.SIGALRM, _handler)
     if io_mode == "stdio":
-        passed = _run_stdio(setup, program, tests, per, budget)
+        cases = _run_stdio(setup, program, tests, per, budget)
     elif io_mode == "function":
-        passed = _run_function(setup, program, prelude, tests, per, budget)
+        cases = _run_function(setup, program, prelude, tests, per, budget)
     else:
         raise ValueError(f"unknown io_mode {io_mode!r}")
-    print("##LCT##" + json.dumps({"passed": passed, "total": len(tests)}))
+    # `cases` is the per-case pass vector; passed/total stay for existing callers.
+    print("##LCT##" + json.dumps({"passed": sum(cases), "total": len(tests), "cases": cases}))
 
 
 if __name__ == "__main__":
